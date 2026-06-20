@@ -85,6 +85,16 @@ py_test(
 )
 
 py_test(
+    name = "raised_cpp_bm25_test",
+    srcs = ["raised_cpp_bm25_test.py"],
+    deps = [
+        "//:enzyme_ad",
+        "@pypi_absl_py//:pkg",
+        "@pypi_jax//:pkg",
+    ],
+)
+
+py_test(
     name = "bench_vs_xla",
     timeout = "long",
     srcs = [

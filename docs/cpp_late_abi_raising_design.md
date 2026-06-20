@@ -79,6 +79,131 @@ C++ source
 The design changes the point at which `entry` is generated, not the fact that
 the final runtime may still use the existing callback ABI.
 
+## Current fork implementation
+
+Branch:
+
+```text
+no-ad-raw-cpp-abi
+```
+
+Fork remote:
+
+```text
+git@github.com:moomoohorse321/Enzyme-JAX-cpp.git
+```
+
+The current fork implements the late-ABI idea as an opt-in `cpp_call` pipeline:
+
+```python
+from enzyme_ad.jax import RaisedCPPPipeline, cpp_call
+
+(scores,) = cpp_call(
+    term_freq,
+    idf,
+    doc_len,
+    query_weight,
+    out_shapes=[jax.core.ShapedArray((4,), jnp.float32)],
+    source=cpp_source,
+    fn="bm25_score",
+    pipeline_options=RaisedCPPPipeline(),
+)
+```
+
+The implementation is intentionally scoped to primal/no-AD C++ calls. It does
+not yet support the forward or reverse C++ AD cases described below.
+
+The implementation adds `CallABI::RaisedTensor`. When this ABI is selected,
+`clang_compile.cc` emits a real flat pointer kernel named
+`__enzyme_jax_raised_kernel`:
+
+```cpp
+extern "C" __attribute__((noinline, used)) void
+__enzyme_jax_raised_kernel(float* out_0, const float* in_0, ...);
+```
+
+That wrapper calls the user-selected function directly with plain C++ pointer
+arguments. It is not the runtime `entry(void**, void**)` ABI.
+
+The C++ source is then compiled to LLVM, imported into MLIR, annotated with
+argument metadata, and passed through the existing raise pipeline. Only after
+that round trip does `clang_compile.cc` synthesize the final runtime
+`entry(void**, void**)` wrapper around the raised kernel.
+
+The main implementation files are:
+
+- `src/enzyme_ad/jax/primitives.py`: exposes `RaisedCPPPipeline`.
+- `src/enzyme_ad/jax/clang_compile.h`: adds `CallABI::RaisedTensor`.
+- `src/enzyme_ad/jax/enzyme_call.cc`: binds the new ABI enum to Python.
+- `src/enzyme_ad/jax/clang_compile.cc`: builds the flat pointer wrapper, runs
+  the LLVM-to-MLIR round trip, and adds the final runtime entry wrapper late.
+- `src/enzyme_ad/jax/raise.cpp`: adds `runLLVMToMLIRRoundTripWithArgSpec` and
+  attaches `enzymexla.memref_type` attrs to imported function arguments.
+- `src/enzyme_ad/jax/Passes/LLVMToMemrefAccess.cpp`: consumes those attrs and
+  rewrites eligible `!llvm.ptr` function arguments to `memref<...>`.
+
+## Type recovery model in the current fork
+
+This fork does not recover pointee types from opaque LLVM pointer types. In
+LLVM dialect MLIR, `!llvm.ptr` is still opaque.
+
+The current sources of useful memory type information are:
+
+1. explicit kernel argument metadata attached as `enzymexla.memref_type`;
+2. local operation types such as `llvm.load` result types, `llvm.store` value
+   types, and `llvm.getelementptr` element types;
+3. existing `memref2pointer` / `pointer2memref` bridge ops and their
+   canonicalization patterns.
+
+There is no general interprocedural propagation pass that takes a typed root
+argument in function `A`, sees `A -> B -> C`, and rewrites `B` and `C` formal
+arguments to memrefs. Small helper functions may still raise well because the
+pipeline runs inlining before `llvm-to-memref-access`; after inlining, their
+loads and stores are local to the typed root function. If a helper function is
+not inlined, its pointer arguments generally remain `!llvm.ptr` unless a future
+call-graph propagation pass is added.
+
+This is good enough for the first target: numeric C++ kernels whose heavy
+memory accesses are either in the exported kernel or are inlined before access
+raising.
+
+## Verification status
+
+The fork contains two tests for the implemented path:
+
+- `test/lit_tests/raising/llvm_to_memref_access_arg_attrs.mlir`: checks that
+  explicit `enzymexla.memref_type` attrs rewrite opaque pointer function
+  arguments to memrefs.
+- `test/raised_cpp_bm25_test.py`: a narrow end-to-end BM25-style
+  `RaisedCPPPipeline` test that avoids the large shared `test/test.py`
+  dependency set.
+
+Useful x86 commands:
+
+```bash
+bazel test //test/lit_tests:raising_llvm_to_memref_access_arg_attrs.mlir.test
+bazel test //test:raised_cpp_bm25_test
+```
+
+If the x86 environment has the full pinned Python package set available, this
+broader test is also useful:
+
+```bash
+bazel test //test:test --test_filter=test_raised_cpp_pointer_bm25_kernel
+```
+
+On the aarch64 Slurm machine, the lit test passed after a native Bazel build,
+but the end-to-end Python test could not be completed there. The original
+`//test:test` target pulled in pinned `xprof==2.21.3`; PyPI provides that
+version for Linux x86_64 and macOS arm64 but not Linux aarch64. A narrow test
+target was added to avoid `xprof`, but the aarch64 build then hit external XLA
+and XNNPACK compiler issues: GCC rejected Clang-only XLA flags, while Cray
+Clang crashed in the external XNNPACK `arm64_sme.cc` backend path.
+
+Those aarch64 failures are build environment/toolchain blockers, not known
+logical failures in the late-ABI raising implementation. The x86 machine should
+be the better place to finish the end-to-end verification.
+
 ## Signature metadata
 
 Opaque-pointer LLVM IR does not carry pointer element types in function
