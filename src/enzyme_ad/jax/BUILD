@@ -90,6 +90,7 @@ cc_library(
         "-Wno-unused-variable",
     ],
     deps = [
+        "//:RaiseLib",
         ":compile_with_xla",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",

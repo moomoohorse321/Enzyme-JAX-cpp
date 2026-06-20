@@ -27,6 +27,7 @@ LANG_LLVM = enzyme_call.Language.LLVM
 LANG_MHLO = enzyme_call.Language.MHLO
 CALL_ABI_TENSOR = enzyme_call.CallABI.Tensor
 CALL_ABI_RAW_ENTRY = enzyme_call.CallABI.RawEntry
+CALL_ABI_RAISED_TENSOR = getattr(enzyme_call.CallABI, "RaisedTensor", None)
 
 Primitive = jax.extend.core.Primitive
 
@@ -84,6 +85,11 @@ class XLAPipeline:
 
     def export_llvm(self):
         return self.exportname
+
+
+class RaisedCPPPipeline(XLAPipeline):
+    def raise_cpp(self):
+        return True
 
 
 class JaXPipeline:
@@ -1126,6 +1132,17 @@ def cpp_call(
     argv: tuple[str] = (),
     pipeline_options=DefaultCPPPipeline,
 ):
+    raise_cpp = getattr(pipeline_options, "raise_cpp", lambda: False)()
+    if raise_cpp and CALL_ABI_RAISED_TENSOR is None:
+        raise RuntimeError(
+            "Raised C++ cpp_call requires an enzyme_call native extension built "
+            "with CallABI.RaisedTensor"
+        )
+    call_abi = (
+        CALL_ABI_RAISED_TENSOR
+        if raise_cpp
+        else CALL_ABI_TENSOR
+    )
     return ffi_call(
         *args,
         source=source,
@@ -1133,7 +1150,7 @@ def cpp_call(
         argv=argv,
         out_shapes=out_shapes,
         lang=LANG_CPP,
-        call_abi=CALL_ABI_TENSOR,
+        call_abi=call_abi,
         pipeline_options=pipeline_options,
     )
 

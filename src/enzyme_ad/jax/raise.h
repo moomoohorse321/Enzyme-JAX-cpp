@@ -25,6 +25,7 @@
 
 #include "src/enzyme_ad/jax/RegistryUtils.h"
 #include "llvm/Support/TargetSelect.h"
+#include <string>
 #include <system_error>
 
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
@@ -34,3 +35,9 @@ extern "C" std::string runLLVMToMLIRRoundTrip(std::string input,
                                               std::string outfile,
                                               std::string backend,
                                               std::string library);
+
+std::string runLLVMToMLIRRoundTripWithArgSpec(std::string input,
+                                              std::string outfile,
+                                              std::string backend,
+                                              std::string library,
+                                              std::string argSpec);

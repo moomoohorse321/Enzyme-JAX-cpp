@@ -20,6 +20,7 @@ namespace enzyme {
 using namespace mlir;
 
 using PtrVal = TypedValue<LLVM::LLVMPointerType>;
+static constexpr StringRef kMemrefTypeAttrName = "enzymexla.memref_type";
 
 namespace mlir {
 MemRefType recoverMemRefTypeFromKernelCall(enzymexla::KernelCallOp kernelCallOp,
@@ -66,23 +67,54 @@ struct LLVMToMemrefAccessPass
         return;
       funcToKernelMap[callee].insert(callOp);
     });
-    if (funcToKernelMap.empty())
+    SetVector<FunctionOpInterface> candidateCallees;
+    for (auto &entry : funcToKernelMap)
+      candidateCallees.insert(entry.first);
+
+    moduleOp->walk([&](FunctionOpInterface func) {
+      for (unsigned i = 0, e = func.getNumArguments(); i != e; ++i) {
+        if (func.getArgAttr(i, kMemrefTypeAttrName)) {
+          candidateCallees.insert(func);
+          break;
+        }
+      }
+    });
+
+    if (candidateCallees.empty())
       return;
 
     // Recover memref types for callees
-    for (auto [callee, callers] : funcToKernelMap) {
+    for (auto callee : candidateCallees) {
+      auto callersIt = funcToKernelMap.find(callee);
+      SetVector<CallOpInterface> *callers =
+          callersIt == funcToKernelMap.end() ? nullptr : &callersIt->second;
       SmallVector<Type> newTypes;
       SmallVector<unsigned> indices;
       for (auto [index, calleeArgTy, calleeArg] :
            llvm::enumerate(callee.getArgumentTypes(), callee.getArguments())) {
-        assert(!callers.empty());
         if (auto ptrTy = dyn_cast<LLVM::LLVMPointerType>(calleeArgTy)) {
+          if (auto attr = callee.getArgAttr(index, kMemrefTypeAttrName)) {
+            if (auto memrefTypeAttr = dyn_cast<TypeAttr>(attr)) {
+              if (auto memrefTy =
+                      dyn_cast<MemRefType>(memrefTypeAttr.getValue())) {
+                newTypes.push_back(memrefTy);
+                indices.push_back(index);
+                continue;
+              }
+            }
+          }
+
+          if (!callers || callers->empty()) {
+            newTypes.push_back(calleeArgTy);
+            continue;
+          }
+
           bool sameElementTypeAcrossCallers = true;
           bool sameShapeAcrossCallers = true;
           ArrayRef<int64_t> shape;
           Type elTy;
           // A kernel can be called by multiple KernelCallOps
-          for (auto caller : callers) {
+          for (auto caller : *callers) {
             Value callerArg = caller.getArgOperands()[index];
             Type callerArgTy = callerArg.getType();
 
@@ -146,6 +178,8 @@ struct LLVMToMemrefAccessPass
           } else {
             newTypes.push_back(calleeArgTy);
           }
+        } else {
+          newTypes.push_back(calleeArgTy);
         }
       }
 
@@ -194,9 +228,16 @@ struct LLVMToMemrefAccessPass
         // the old one
         newFunc->setAttr("function_type", TypeAttr::get(newFuncTy));
 
-        // Iterate over each argument and copy its attributes
+        // Iterate over each argument and copy its attributes. The explicit
+        // memref type metadata has been consumed by this rewrite.
         for (unsigned i = 0; i < callee.getNumArguments(); ++i) {
-          newFunc.setArgAttrs(i, callee.getArgAttrs(i));
+          SmallVector<NamedAttribute> attrs;
+          for (auto attr : callee.getArgAttrs(i)) {
+            if (attr.getName() == kMemrefTypeAttrName)
+              continue;
+            attrs.push_back(attr);
+          }
+          newFunc.setArgAttrs(i, DictionaryAttr::get(ctx, attrs));
         }
         callee->erase();
       }

@@ -12,8 +12,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Pass/PassRegistry.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Target/LLVMIR/Import.h"
 #include "llvm/IR/Instructions.h"
@@ -24,15 +26,118 @@
 
 #include "src/enzyme_ad/jax/RegistryUtils.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/ADT/SmallVector.h"
 #include <system_error>
 
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/NVVM/NVVMToLLVMIRTranslation.h"
 
-extern "C" std::string runLLVMToMLIRRoundTrip(std::string input,
-                                              std::string outfile,
-                                              std::string backend,
-                                              std::string library) {
+namespace {
+
+mlir::Type parseArgSpecElementType(llvm::StringRef typeName,
+                                   mlir::MLIRContext *context) {
+  using namespace mlir;
+  if (typeName == "bool")
+    return IntegerType::get(context, 1);
+  if (typeName == "char" || typeName == "int8_t")
+    return IntegerType::get(context, 8);
+  if (typeName == "uint8_t")
+    return IntegerType::get(context, 8, IntegerType::Unsigned);
+  if (typeName == "bfloat16")
+    return BFloat16Type::get(context);
+  if (typeName == "float")
+    return Float32Type::get(context);
+  if (typeName == "double")
+    return Float64Type::get(context);
+  if (typeName == "int16_t")
+    return IntegerType::get(context, 16);
+  if (typeName == "uint16_t")
+    return IntegerType::get(context, 16, IntegerType::Unsigned);
+  if (typeName == "int32_t")
+    return IntegerType::get(context, 32);
+  if (typeName == "uint32_t")
+    return IntegerType::get(context, 32, IntegerType::Unsigned);
+  if (typeName == "int64_t")
+    return IntegerType::get(context, 64);
+  if (typeName == "uint64_t")
+    return IntegerType::get(context, 64, IntegerType::Unsigned);
+  if (typeName == "std::complex<float>")
+    return ComplexType::get(Float32Type::get(context));
+  if (typeName == "std::complex<double>")
+    return ComplexType::get(Float64Type::get(context));
+  return {};
+}
+
+bool attachMemrefArgSpec(mlir::ModuleOp mod, llvm::StringRef argSpec,
+                         llvm::raw_ostream &err) {
+  if (argSpec.empty())
+    return true;
+
+  llvm::SmallVector<llvm::StringRef> parts;
+  argSpec.split(parts, '|');
+  if (parts.empty() || parts[0].empty()) {
+    err << "empty C++ raise argument spec\n";
+    return false;
+  }
+
+  auto func = mod.lookupSymbol<mlir::FunctionOpInterface>(parts[0]);
+  if (!func) {
+    err << "could not find C++ raise function '" << parts[0] << "'\n";
+    return false;
+  }
+  if (func.getNumArguments() < parts.size() - 1) {
+    err << "C++ raise argument spec has " << (parts.size() - 1)
+        << " arguments but function has " << func.getNumArguments() << "\n";
+    return false;
+  }
+
+  auto *context = mod->getContext();
+  for (auto indexed :
+       llvm::enumerate(llvm::ArrayRef<llvm::StringRef>(parts).drop_front())) {
+    llvm::StringRef arg = indexed.value();
+    auto typeAndShape = arg.split(':');
+    auto elementType = parseArgSpecElementType(typeAndShape.first, context);
+    if (!elementType) {
+      err << "unsupported C++ raise element type '" << typeAndShape.first
+          << "'\n";
+      return false;
+    }
+
+    llvm::SmallVector<int64_t> shape;
+    if (!typeAndShape.second.empty()) {
+      llvm::SmallVector<llvm::StringRef> dims;
+      typeAndShape.second.split(dims, 'x');
+      for (llvm::StringRef dim : dims) {
+        if (dim.empty()) {
+          err << "empty dimension in C++ raise argument spec '" << arg << "'\n";
+          return false;
+        }
+        if (dim == "?") {
+          shape.push_back(mlir::ShapedType::kDynamic);
+          continue;
+        }
+        int64_t value = 0;
+        if (dim.getAsInteger(10, value)) {
+          err << "invalid dimension '" << dim
+              << "' in C++ raise argument spec\n";
+          return false;
+        }
+        shape.push_back(value);
+      }
+    }
+
+    auto memrefType = mlir::MemRefType::get(shape, elementType);
+    func.setArgAttr(indexed.index(), "enzymexla.memref_type",
+                    mlir::TypeAttr::get(memrefType));
+  }
+
+  return true;
+}
+
+std::string runLLVMToMLIRRoundTripImpl(std::string input, std::string outfile,
+                                       std::string backend,
+                                       std::string library,
+                                       std::string argSpec) {
   llvm::LLVMContext Context;
   Context.setDiscardValueNames(false);
   llvm::SMDiagnostic Err;
@@ -60,6 +165,13 @@ extern "C" std::string runLLVMToMLIRRoundTrip(std::string input,
                                            /*dropDICompositeElements*/ false);
   if (!mod) {
     exit(1);
+  }
+
+  std::string arg_spec_error;
+  llvm::raw_string_ostream arg_spec_error_stream(arg_spec_error);
+  if (!attachMemrefArgSpec(*mod, argSpec, arg_spec_error_stream)) {
+    llvm::errs() << arg_spec_error_stream.str() << "\n";
+    return "";
   }
 
   mlir::OpPrintingFlags flags;
@@ -245,4 +357,25 @@ extern "C" std::string runLLVMToMLIRRoundTrip(std::string input,
   }
 
   return res;
+}
+
+} // namespace
+
+extern "C" std::string runLLVMToMLIRRoundTrip(std::string input,
+                                              std::string outfile,
+                                              std::string backend,
+                                              std::string library) {
+  return runLLVMToMLIRRoundTripImpl(std::move(input), std::move(outfile),
+                                    std::move(backend), std::move(library),
+                                    "");
+}
+
+std::string runLLVMToMLIRRoundTripWithArgSpec(std::string input,
+                                              std::string outfile,
+                                              std::string backend,
+                                              std::string library,
+                                              std::string argSpec) {
+  return runLLVMToMLIRRoundTripImpl(std::move(input), std::move(outfile),
+                                    std::move(backend), std::move(library),
+                                    std::move(argSpec));
 }

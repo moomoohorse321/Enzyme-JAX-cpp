@@ -5,6 +5,7 @@ from enzyme_ad.jax.primitives import (
     hlo_call,
     enzyme_jax_ir,
     XLAPipeline,
+    RaisedCPPPipeline,
     JaXPipeline,
     optimize_module,
     export,

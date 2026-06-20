@@ -368,7 +368,8 @@ NB_MODULE(enzyme_call, m) {
 
   nanobind::enum_<CallABI>(m, "CallABI")
       .value("Tensor", CallABI::Tensor)
-      .value("RawEntry", CallABI::RawEntry);
+      .value("RawEntry", CallABI::RawEntry)
+      .value("RaisedTensor", CallABI::RaisedTensor);
 
   m.def("create_enzyme_kernel",
         [](const std::string &source, const std::string &fn,

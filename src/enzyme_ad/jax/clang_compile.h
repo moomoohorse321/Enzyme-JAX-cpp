@@ -17,7 +17,7 @@ enum class ABI { Primal, Forward, Augmented, Reverse, Tape };
 
 enum class Language : int { CPP = 0, LLVM = 1, MHLO = 2 };
 
-enum class CallABI : int { Tensor = 0, RawEntry = 1 };
+enum class CallABI : int { Tensor = 0, RawEntry = 1, RaisedTensor = 2 };
 
 absl::StatusOr<std::unique_ptr<llvm::Module>>
 GetLLVMFromJob(std::string filename, std::string filecontents, bool cpp,

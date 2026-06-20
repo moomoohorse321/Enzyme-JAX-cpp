@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang_compile.h"
+#include "raise.h"
 #include "llvm/IRReader/IRReader.h"
 
 #include <cstring>
@@ -17,6 +18,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <string>
+#include <system_error>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -31,9 +33,11 @@
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/AsmParser/SlotMapping.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
@@ -672,6 +676,119 @@ std::string make_type(std::string typenam, llvm::ArrayRef<int64_t> shape,
   return s + ">";
 }
 
+std::string make_pointer_type(std::string typenam, bool constv) {
+  return std::string(constv ? "const " : "") + typenam + " *";
+}
+
+std::string make_raise_arg_spec(
+    llvm::StringRef fn, llvm::ArrayRef<llvm::SmallVector<int64_t>> out_shapes,
+    llvm::ArrayRef<std::string> out_names,
+    llvm::ArrayRef<llvm::SmallVector<int64_t>> in_shapes,
+    llvm::ArrayRef<std::string> in_names) {
+  std::string spec;
+  llvm::raw_string_ostream os(spec);
+  os << fn;
+  auto appendArg = [&](llvm::StringRef typeName, llvm::ArrayRef<int64_t> shape) {
+    os << "|" << typeName << ":";
+    for (auto indexed : llvm::enumerate(shape)) {
+      if (indexed.index() != 0)
+        os << "x";
+      os << indexed.value();
+    }
+  };
+  for (size_t i = 0; i < out_shapes.size(); ++i)
+    appendArg(out_names[i], out_shapes[i]);
+  for (size_t i = 0; i < in_shapes.size(); ++i)
+    appendArg(in_names[i], in_shapes[i]);
+  return os.str();
+}
+
+absl::Status add_late_entry_wrapper(llvm::Module &mod, llvm::StringRef kernelName,
+                                    size_t numOut, size_t numIn) {
+  if (mod.getFunction("entry"))
+    return absl::InvalidArgumentError(
+        "late C++ raise expected no pre-existing entry function");
+
+  auto *kernel = mod.getFunction(kernelName);
+  if (!kernel) {
+    std::string err;
+    llvm::raw_string_ostream os(err);
+    os << "late C++ raise could not find kernel function '" << kernelName
+       << "' after MLIR round trip\n";
+    os << mod << "\n";
+    return absl::InternalError(os.str());
+  }
+
+  if (kernel->arg_size() != numOut + numIn) {
+    std::string err;
+    llvm::raw_string_ostream os(err);
+    os << "late C++ raise expected " << (numOut + numIn)
+       << " kernel pointer arguments, but got " << kernel->arg_size() << "\n";
+    os << *kernel << "\n";
+    return absl::InternalError(os.str());
+  }
+
+  auto &ctx = mod.getContext();
+  auto *voidTy = llvm::Type::getVoidTy(ctx);
+  auto *ptrTy = llvm::PointerType::get(ctx, 0);
+  auto *i64Ty = llvm::Type::getInt64Ty(ctx);
+  auto *entryTy = llvm::FunctionType::get(voidTy, {ptrTy, ptrTy}, false);
+  auto *entry = llvm::Function::Create(
+      entryTy, llvm::GlobalValue::ExternalLinkage, "entry", mod);
+  entry->setDSOLocal(true);
+  entry->getArg(0)->setName("outs");
+  entry->getArg(1)->setName("ins");
+
+  auto *block = llvm::BasicBlock::Create(ctx, "entry", entry);
+  llvm::IRBuilder<> builder(block);
+
+  auto loadPointer = [&](llvm::Value *table, size_t index,
+                         llvm::Type *expectedType) -> llvm::Expected<llvm::Value *> {
+    auto *idx = llvm::ConstantInt::get(i64Ty, index);
+    auto *slot = builder.CreateInBoundsGEP(ptrTy, table, idx);
+    auto *loaded = builder.CreateLoad(ptrTy, slot);
+    if (loaded->getType() == expectedType)
+      return loaded;
+    auto *expectedPtr = llvm::dyn_cast<llvm::PointerType>(expectedType);
+    if (!expectedPtr) {
+      return llvm::createStringError(
+          std::errc::invalid_argument,
+          "late C++ raise can only build entry wrappers for pointer kernel "
+          "arguments");
+    }
+    if (loaded->getType()->getPointerAddressSpace() ==
+        expectedPtr->getAddressSpace())
+      return loaded;
+    return builder.CreateAddrSpaceCast(loaded, expectedPtr);
+  };
+
+  llvm::SmallVector<llvm::Value *> callArgs;
+  callArgs.reserve(numOut + numIn);
+  auto argIt = kernel->arg_begin();
+  for (size_t i = 0; i < numOut; ++i, ++argIt) {
+    auto loaded = loadPointer(entry->getArg(0), i, argIt->getType());
+    if (!loaded)
+      return absl::InternalError(llvm::toString(loaded.takeError()));
+    callArgs.push_back(*loaded);
+  }
+  for (size_t i = 0; i < numIn; ++i, ++argIt) {
+    auto loaded = loadPointer(entry->getArg(1), i, argIt->getType());
+    if (!loaded)
+      return absl::InternalError(llvm::toString(loaded.takeError()));
+    callArgs.push_back(*loaded);
+  }
+
+  builder.CreateCall(kernel, callArgs);
+  builder.CreateRetVoid();
+
+  std::string verifyError;
+  llvm::raw_string_ostream verifyStream(verifyError);
+  if (llvm::verifyModule(mod, &verifyStream))
+    return absl::InternalError(verifyStream.str());
+
+  return absl::OkStatus();
+}
+
 absl::StatusOr<std::tuple<std::unique_ptr<llvm::Module>,
                           std::unique_ptr<llvm::LLVMContext>, size_t, size_t>>
 createLLVMMod(std::string fn, llvm::StringRef source,
@@ -687,6 +804,7 @@ createLLVMMod(std::string fn, llvm::StringRef source,
   std::string input;
   llvm::raw_string_ostream ss(input);
   ss << "#include <cstdint>\n";
+  ss << "#include <complex>\n";
   if (call_abi == CallABI::Tensor) {
     ss << "#include <enzyme/tensor>\n";
     ss << "#include <enzyme/utils>\n";
@@ -726,6 +844,99 @@ createLLVMMod(std::string fn, llvm::StringRef source,
     }
     auto mod = std::move(mod_or_err).value();
     return std::make_tuple(std::move(mod), std::move(llvm_ctx),
+                           out_shapes.size(), /*tmpBuf*/ 0);
+  }
+
+  if (call_abi == CallABI::RaisedTensor) {
+    if (mode != ABI::Primal) {
+      return absl::InvalidArgumentError(
+          "RaisedTensor C++ ABI currently supports primal/no-AD calls only");
+    }
+    if (lang != ::Language::CPP) {
+      return absl::InvalidArgumentError(
+          "RaisedTensor C++ ABI currently expects C++ source");
+    }
+
+    constexpr llvm::StringLiteral raisedKernelName =
+        "__enzyme_jax_raised_kernel";
+    ss << source << "\n";
+    ss << "extern \"C\" __attribute__((noinline, used)) void "
+       << raisedKernelName << "(";
+    bool comma = false;
+    for (size_t i = 0; i < out_shapes.size(); i++) {
+      if (comma)
+        ss << ", ";
+      ss << make_pointer_type(out_names[i], /*constv*/ false)
+         << " __restrict__ out_" << i;
+      comma = true;
+    }
+    for (size_t i = 0; i < in_shapes.size(); i++) {
+      if (comma)
+        ss << ", ";
+      ss << make_pointer_type(in_names[i], /*constv*/ true)
+         << " __restrict__ in_" << i;
+      comma = true;
+    }
+    ss << ") {\n";
+    ss << "  " << fn << "(";
+    comma = false;
+    for (size_t i = 0; i < out_shapes.size(); i++) {
+      if (comma)
+        ss << ", ";
+      ss << "out_" << i;
+      comma = true;
+    }
+    for (size_t i = 0; i < in_shapes.size(); i++) {
+      if (comma)
+        ss << ", ";
+      ss << "in_" << i;
+      comma = true;
+    }
+    ss << ");\n";
+    ss << "}\n";
+
+    auto mod_or_err =
+        GetLLVMFromJob("/enzyme_call/source.cpp", ss.str(), /*cpp*/ true,
+                       pyargv_strs, llvm_ctx.get(), std::move(linkMod));
+    if (!mod_or_err.ok()) {
+      llvm::errs() << "Source:\n" << ss.str() << "\n";
+      return mod_or_err.status();
+    }
+    auto preRaiseMod = std::move(mod_or_err).value();
+
+    std::string preRaiseIR;
+    llvm::raw_string_ostream preRaiseOS(preRaiseIR);
+    preRaiseOS << *preRaiseMod;
+    preRaiseOS.flush();
+
+    std::string raisedIR = runLLVMToMLIRRoundTripWithArgSpec(
+        preRaiseIR, /*outfile*/ "", /*backend*/ "cpu", /*library*/ "",
+        make_raise_arg_spec(raisedKernelName, out_shapes, out_names, in_shapes,
+                            in_names));
+    if (raisedIR.empty()) {
+      return absl::InternalError(
+          "late C++ raise failed while running LLVM-to-MLIR round trip");
+    }
+
+    llvm_ctx = std::make_unique<llvm::LLVMContext>();
+    llvm_ctx->setDiscardValueNames(false);
+    llvm::SMDiagnostic Err;
+    auto raisedMod = llvm::parseIR(llvm::MemoryBufferRef(raisedIR, "<raised>"),
+                                   Err, *llvm_ctx);
+    if (!raisedMod) {
+      std::string err_str;
+      llvm::raw_string_ostream err_stream(err_str);
+      Err.print("raised_llvm", err_stream, false);
+      return absl::InternalError("failed to parse raised LLVM IR: " +
+                                 err_stream.str());
+    }
+
+    auto status = add_late_entry_wrapper(*raisedMod, raisedKernelName,
+                                         out_shapes.size(), in_shapes.size());
+    if (!status.ok())
+      return status;
+
+    return std::make_tuple(std::move(raisedMod), std::move(llvm_ctx),
                            out_shapes.size(), /*tmpBuf*/ 0);
   }
 
