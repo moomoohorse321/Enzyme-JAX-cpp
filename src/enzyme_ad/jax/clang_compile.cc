@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang_compile.h"
+#include "raise.h"
 #include "llvm/IRReader/IRReader.h"
 
 #include <cstring>
@@ -24,6 +25,7 @@
 #include "llvm-c/Core.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/AsmParser/LLLexer.h"
 #include "llvm/AsmParser/LLParser.h"
@@ -172,10 +174,22 @@ static TargetMachine *GetTargetMachine(llvm::Triple TheTriple, StringRef CPUStr,
       codegen::getExplicitRelocModel(), codegen::getExplicitCodeModel(), level);
 }
 
-absl::StatusOr<std::unique_ptr<llvm::Module>>
-GetLLVMFromJob(std::string filename, std::string filecontents, bool cpp,
+namespace {
+
+constexpr llvm::StringLiteral kPolygeistKernel =
+    "enzyme_jax_polygeist_kernel";
+
+enum class LLVMJobMode {
+  LegacyEntry,
+  PolygeistInput,
+};
+
+} // namespace
+
+static absl::StatusOr<std::unique_ptr<llvm::Module>>
+getLLVMFromJob(std::string filename, std::string filecontents, bool cpp,
                ArrayRef<std::string> pyargv, LLVMContext *Context,
-               std::unique_ptr<llvm::Module> linkMod) {
+               std::unique_ptr<llvm::Module> linkMod, LLVMJobMode mode) {
   const llvm::opt::InputArgList Args;
   const char *binary = cpp ? "clang++" : "clang";
   // Buffer diagnostics from argument parsing so that we can output them using a
@@ -526,6 +540,19 @@ struct tensor<T, n0, N...>
     Linker::linkModules(*mod, std::move(linkMod));
   }
 
+  if (mode == LLVMJobMode::PolygeistInput) {
+    for (auto &f : *mod) {
+      if (f.empty())
+        continue;
+      if (f.getName() == kPolygeistKernel)
+        continue;
+      f.setLinkage(Function::LinkageTypes::InternalLinkage);
+    }
+    // Preserve the structural LLVM emitted by Clang for Polygeist. The final
+    // runtime adapter is compiled through the legacy O3 path below.
+    return std::move(mod);
+  }
+
   for (auto &f : *mod) {
     if (f.empty())
       continue;
@@ -662,6 +689,15 @@ struct tensor<T, n0, N...>
   return std::move(mod);
 }
 
+absl::StatusOr<std::unique_ptr<llvm::Module>>
+GetLLVMFromJob(std::string filename, std::string filecontents, bool cpp,
+               ArrayRef<std::string> pyargv, LLVMContext *Context,
+               std::unique_ptr<llvm::Module> linkMod) {
+  return getLLVMFromJob(std::move(filename), std::move(filecontents), cpp,
+                        pyargv, Context, std::move(linkMod),
+                        LLVMJobMode::LegacyEntry);
+}
+
 std::string make_type(std::string typenam, llvm::ArrayRef<int64_t> shape,
                       bool constv, ::Language lang) {
   std::string s =
@@ -672,6 +708,26 @@ std::string make_type(std::string typenam, llvm::ArrayRef<int64_t> shape,
   return s + ">";
 }
 
+namespace {
+
+std::vector<enzyme_jax::MemRefArgSpec> makeArgumentTypes(
+    llvm::ArrayRef<llvm::SmallVector<int64_t>> outShapes,
+    llvm::ArrayRef<std::string> outTypes,
+    llvm::ArrayRef<llvm::SmallVector<int64_t>> inShapes,
+    llvm::ArrayRef<std::string> inTypes) {
+  std::vector<enzyme_jax::MemRefArgSpec> arguments;
+  arguments.reserve(outShapes.size() + inShapes.size());
+  for (auto [type, shape] : llvm::zip_equal(outTypes, outShapes))
+    arguments.push_back(
+        {type, std::vector<int64_t>(shape.begin(), shape.end())});
+  for (auto [type, shape] : llvm::zip_equal(inTypes, inShapes))
+    arguments.push_back(
+        {type, std::vector<int64_t>(shape.begin(), shape.end())});
+  return arguments;
+}
+
+} // namespace
+
 absl::StatusOr<std::tuple<std::unique_ptr<llvm::Module>,
                           std::unique_ptr<llvm::LLVMContext>, size_t, size_t>>
 createLLVMMod(std::string fn, llvm::StringRef source,
@@ -681,7 +737,8 @@ createLLVMMod(std::string fn, llvm::StringRef source,
               llvm::ArrayRef<std::string> in_names,
               const std::vector<std::string> &pyargv_strs, ABI mode,
               ::Language lang, bool xla_runtime,
-              const std::string &pass_pipeline) {
+              const std::string &pass_pipeline,
+              bool cpp_polygeist) {
   auto llvm_ctx = std::make_unique<llvm::LLVMContext>();
 
   std::string input;
@@ -1127,6 +1184,111 @@ createLLVMMod(std::string fn, llvm::StringRef source,
     }
     ss << "};\n";
     fn = abiName;
+  }
+  if (cpp_polygeist) {
+    if (lang != ::Language::CPP || mode != ABI::Primal)
+      return absl::InvalidArgumentError(
+          "the C++ Polygeist pipeline currently accepts primal C++ kernels");
+
+    ss << "extern \"C\" void " << kPolygeistKernel << "(";
+    bool comma = false;
+    for (size_t i = 0; i < out_shapes.size(); ++i) {
+      if (comma)
+        ss << ", ";
+      ss << out_names[i] << "* out_" << i;
+      comma = true;
+    }
+    for (size_t i = 0; i < in_shapes.size(); ++i) {
+      if (comma)
+        ss << ", ";
+      ss << "const " << in_names[i] << "* in_" << i;
+      comma = true;
+    }
+    ss << ") {\n  " << fn << "(";
+    comma = false;
+    for (size_t i = 0; i < out_shapes.size(); ++i) {
+      if (comma)
+        ss << ", ";
+      ss << "*(" << make_type(out_names[i], out_shapes[i], false, lang)
+         << "*)out_" << i;
+      comma = true;
+    }
+    for (size_t i = 0; i < in_shapes.size(); ++i) {
+      if (comma)
+        ss << ", ";
+      ss << "*(" << make_type(in_names[i], in_shapes[i], true, lang)
+         << "*)in_" << i;
+      comma = true;
+    }
+    ss << ");\n}\n";
+    ss.flush();
+
+    std::string inputLLVM;
+    std::string inputDataLayout;
+    {
+      auto moduleOrError = getLLVMFromJob(
+          "/enzyme_call/source.cpp", input, /*cpp=*/true, pyargv_strs,
+          llvm_ctx.get(), std::move(linkMod), LLVMJobMode::PolygeistInput);
+      if (!moduleOrError.ok())
+        return moduleOrError.status();
+
+      llvm::raw_string_ostream inputLLVMOS(inputLLVM);
+      inputLLVMOS << *moduleOrError.value();
+      inputDataLayout = moduleOrError.value()->getDataLayoutStr();
+    }
+    std::string loweredLLVM = enzyme_jax::runLLVMToMLIRRoundTripWithTypes(
+        inputLLVM, kPolygeistKernel.str(),
+        makeArgumentTypes(out_shapes, out_names, in_shapes, in_names));
+    if (loweredLLVM.empty())
+      return absl::InternalError("C++ Polygeist pipeline failed");
+
+    llvm::SMDiagnostic diagnostic;
+    auto loweredModule = llvm::parseIR(
+        llvm::MemoryBufferRef(loweredLLVM, "<polygeist-lowered>"), diagnostic,
+        *llvm_ctx);
+    if (!loweredModule) {
+      std::string message;
+      llvm::raw_string_ostream messageOS(message);
+      diagnostic.print("polygeist-lowered", messageOS, false);
+      return absl::InternalError(messageOS.str());
+    }
+    loweredModule->setDataLayout(inputDataLayout);
+
+    std::string entrySource;
+    llvm::raw_string_ostream entry(entrySource);
+    entry << "extern \"C\" void " << kPolygeistKernel << "(";
+    for (size_t i = 0; i < out_shapes.size() + in_shapes.size(); ++i) {
+      if (i != 0)
+        entry << ", ";
+      entry << "void*";
+    }
+    entry << ");\nextern \"C\" void entry(void** outs, void** ins) {\n  "
+          << kPolygeistKernel << "(";
+    comma = false;
+    for (size_t i = 0; i < out_shapes.size(); ++i) {
+      if (comma)
+        entry << ", ";
+      entry << "outs[" << i << "]";
+      comma = true;
+    }
+    for (size_t i = 0; i < in_shapes.size(); ++i) {
+      if (comma)
+        entry << ", ";
+      entry << "ins[" << i << "]";
+      comma = true;
+    }
+    entry << ");\n}\n";
+    entry.flush();
+
+    // This final compile uses the existing runtime path, including its O3
+    // pipeline, after the structured MLIR transformations have completed.
+    auto finalModule = GetLLVMFromJob(
+        "/enzyme_call/entry.cpp", entrySource, /*cpp=*/true, pyargv_strs,
+        llvm_ctx.get(), std::move(loweredModule));
+    if (!finalModule.ok())
+      return finalModule.status();
+    return std::make_tuple(std::move(finalModule).value(), std::move(llvm_ctx),
+                           out_shapes.size(), /*tmpBuf=*/0);
   }
   if (mode != ABI::Primal) {
     ss << " void entry_wrap(";

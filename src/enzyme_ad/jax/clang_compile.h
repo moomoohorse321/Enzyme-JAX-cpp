@@ -32,5 +32,6 @@ createLLVMMod(std::string fn, llvm::StringRef source,
               llvm::ArrayRef<std::string> in_names,
               const std::vector<std::string> &pyargv_strs, ABI mode,
               Language lang, bool xla_runtime,
-              const std::string &pass_pipeline);
+              const std::string &pass_pipeline,
+              bool cpp_polygeist = false);
 #endif // ENZYME_JAX_CLANG_COMPILE_H
