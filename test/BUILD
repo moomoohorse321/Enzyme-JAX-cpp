@@ -87,7 +87,10 @@ py_test(
 py_test(
     name = "cpp_polygeist_test",
     srcs = ["cpp_polygeist_test.py"],
-    data = ["cpp_polygeist_apps/transpose.cpp"],
+    data = [
+        "cpp_polygeist_apps/bm25.cpp",
+        "cpp_polygeist_apps/transpose.cpp",
+    ],
     deps = [
         "//:enzyme_ad",
         "@pypi_absl_py//:pkg",
