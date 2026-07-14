@@ -30,6 +30,22 @@
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/NVVM/NVVMToLLVMIRTranslation.h"
 
+#include <cstdint>
+#include <vector>
+
+namespace enzyme_jax {
+
+struct MemRefArgSpec {
+  std::string elementType;
+  std::vector<int64_t> shape;
+};
+
+std::string runLLVMToMLIRRoundTripWithTypes(
+    std::string llvmIR, std::string kernelName,
+    const std::vector<MemRefArgSpec> &arguments);
+
+} // namespace enzyme_jax
+
 extern "C" std::string runLLVMToMLIRRoundTrip(std::string input,
                                               std::string outfile,
                                               std::string backend,

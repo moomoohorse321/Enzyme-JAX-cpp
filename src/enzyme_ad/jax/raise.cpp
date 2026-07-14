@@ -11,7 +11,12 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "raise.h"
+
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Target/LLVMIR/Export.h"
@@ -29,10 +34,78 @@
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/NVVM/NVVMToLLVMIRTranslation.h"
 
-extern "C" std::string runLLVMToMLIRRoundTrip(std::string input,
-                                              std::string outfile,
-                                              std::string backend,
-                                              std::string library) {
+namespace {
+
+mlir::Type parseElementType(llvm::StringRef name,
+                            mlir::MLIRContext *context) {
+  using namespace mlir;
+  if (name == "bool")
+    return IntegerType::get(context, 1);
+  if (name == "char")
+    return IntegerType::get(context, 8);
+  if (name == "bfloat16")
+    return BFloat16Type::get(context);
+  if (name == "float")
+    return Float32Type::get(context);
+  if (name == "double")
+    return Float64Type::get(context);
+  if (name == "int32_t")
+    return IntegerType::get(context, 32);
+  if (name == "uint32_t")
+    return IntegerType::get(context, 32, IntegerType::Unsigned);
+  if (name == "int64_t")
+    return IntegerType::get(context, 64);
+  if (name == "uint64_t")
+    return IntegerType::get(context, 64, IntegerType::Unsigned);
+  if (name == "std::complex<float>")
+    return ComplexType::get(Float32Type::get(context));
+  if (name == "std::complex<double>")
+    return ComplexType::get(Float64Type::get(context));
+  return {};
+}
+
+bool attachArgumentTypes(
+    mlir::ModuleOp module, llvm::StringRef kernelName,
+    const std::vector<enzyme_jax::MemRefArgSpec> &arguments) {
+  if (arguments.empty())
+    return true;
+  auto function = module.lookupSymbol<mlir::FunctionOpInterface>(kernelName);
+  if (!function) {
+    llvm::errs() << "could not find imported C++ kernel '" << kernelName
+                 << "'\n";
+    return false;
+  }
+  if (function.getNumArguments() != arguments.size()) {
+    llvm::errs() << "C++ kernel '" << kernelName << "' has "
+                 << function.getNumArguments() << " arguments, expected "
+                 << arguments.size() << "\n";
+    return false;
+  }
+  for (auto [index, specification] : llvm::enumerate(arguments)) {
+    if (!mlir::isa<mlir::LLVM::LLVMPointerType>(
+            function.getArgumentTypes()[index])) {
+      llvm::errs() << "C++ kernel argument " << index
+                   << " is not an LLVM pointer\n";
+      return false;
+    }
+    auto elementType = parseElementType(specification.elementType,
+                                        module->getContext());
+    if (!elementType) {
+      llvm::errs() << "unsupported C++ element type '"
+                   << specification.elementType << "'\n";
+      return false;
+    }
+    auto memrefType = mlir::MemRefType::get(specification.shape, elementType);
+    function.setArgAttr(index, "enzymexla.memref_type",
+                        mlir::TypeAttr::get(memrefType));
+  }
+  return true;
+}
+
+std::string runLLVMToMLIRRoundTripImpl(
+    std::string input, std::string outfile, std::string backend,
+    std::string library, llvm::StringRef kernelName,
+    const std::vector<enzyme_jax::MemRefArgSpec> &arguments) {
   llvm::LLVMContext Context;
   Context.setDiscardValueNames(false);
   llvm::SMDiagnostic Err;
@@ -62,6 +135,9 @@ extern "C" std::string runLLVMToMLIRRoundTrip(std::string input,
     exit(1);
   }
 
+  if (!attachArgumentTypes(*mod, kernelName, arguments))
+    return "";
+
   mlir::OpPrintingFlags flags;
   if (getenv("DEBUG_REACTANT_INFO"))
     flags.enableDebugInfo(true, /*pretty*/ false);
@@ -82,8 +158,13 @@ extern "C" std::string runLLVMToMLIRRoundTrip(std::string input,
   using namespace llvm;
   using namespace mlir;
   // clang-format off
-  std::string pass_pipeline =
-      "inline{default-pipeline=canonicalize "
+  std::string pass_pipeline;
+  if (!arguments.empty()) {
+    // Materialize the JAX type contract before wrapper cleanup can rebuild the
+    // function and discard argument attributes.
+    pass_pipeline = "llvm-to-memref-access,";
+  }
+  pass_pipeline += "inline{default-pipeline=canonicalize "
       "max-iterations=4},sroa-wrappers{set_private=false attributor=false},"
       "lift-tessera-annotations,parse-optimization-rules,"
       "gpu-launch-recognition{backend=";
@@ -96,8 +177,10 @@ extern "C" std::string runLLVMToMLIRRoundTrip(std::string input,
     pass_pipeline += "parallel-lower{wrapParallelOps=false},";
   else
     pass_pipeline += "parallel-lower{wrapParallelOps=true},";
-  pass_pipeline += "llvm-to-"
-      "memref-access,polygeist-mem2reg,canonicalize,convert-llvm-to-cf,"
+  if (arguments.empty())
+    pass_pipeline += "llvm-to-memref-access,";
+  pass_pipeline +=
+      "polygeist-mem2reg,canonicalize,convert-llvm-to-cf,"
       "canonicalize,polygeist-mem2reg,canonicalize,enzyme-lift-cf-to-scf,"
       "canonicalize,"
       "func.func(canonicalize-loops),"
@@ -147,6 +230,9 @@ extern "C" std::string runLLVMToMLIRRoundTrip(std::string input,
       }
       pass_pipeline += "canonicalize,convert-polygeist-to-llvm{backend=";
       pass_pipeline += backend;
+      if (!arguments.empty())
+        pass_pipeline += " use-bare-ptr-memref-call-conv=true "
+                         "use-c-style-memref=false";
       pass_pipeline += "},strip-"
       "gpu-info,gpu-"
       "module-to-binary";
@@ -245,4 +331,26 @@ extern "C" std::string runLLVMToMLIRRoundTrip(std::string input,
   }
 
   return res;
+}
+
+} // namespace
+
+extern "C" std::string runLLVMToMLIRRoundTrip(std::string input,
+                                              std::string outfile,
+                                              std::string backend,
+                                              std::string library) {
+  return runLLVMToMLIRRoundTripImpl(
+      std::move(input), std::move(outfile), std::move(backend),
+      std::move(library), "", {});
+}
+
+std::string enzyme_jax::runLLVMToMLIRRoundTripWithTypes(
+    std::string llvmIR, std::string kernelName,
+    const std::vector<MemRefArgSpec> &arguments) {
+  // The current typed C++ caller is CPU-only and consumes LLVM in memory.
+  // It therefore has no GPU device library for gpu-module-to-binary and no
+  // outfile prefix for the optional EXPORT_REACTANT MLIR dump.
+  return runLLVMToMLIRRoundTripImpl(
+      std::move(llvmIR), /*outfile=*/"", /*backend=*/"cpu", /*library=*/"",
+      kernelName, arguments);
 }
