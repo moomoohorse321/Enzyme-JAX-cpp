@@ -85,6 +85,17 @@ py_test(
 )
 
 py_test(
+    name = "cpp_polygeist_test",
+    srcs = ["cpp_polygeist_test.py"],
+    data = ["cpp_polygeist_apps/transpose.cpp"],
+    deps = [
+        "//:enzyme_ad",
+        "@pypi_absl_py//:pkg",
+        "@pypi_jax//:pkg",
+    ],
+)
+
+py_test(
     name = "bench_vs_xla",
     timeout = "long",
     srcs = [

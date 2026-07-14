@@ -4,6 +4,7 @@ from enzyme_ad.jax.primitives import (
     hlo_call,
     enzyme_jax_ir,
     XLAPipeline,
+    CPPPolygeistPipeline,
     JaXPipeline,
     optimize_module,
     export,

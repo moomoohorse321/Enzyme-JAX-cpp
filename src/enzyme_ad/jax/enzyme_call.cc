@@ -168,7 +168,7 @@ public:
          llvm::ArrayRef<llvm::SmallVector<int64_t>> in_shapes,
          llvm::ArrayRef<std::string> in_names, PyObject *pyargv, ABI mode,
          Language lang, bool xla_runtime, const std::string &pass_pipeline,
-         const std::string &platform) {
+         const std::string &platform, bool cpp_polygeist) {
     if (platform != "cpu")
       return std::make_tuple(UNKNOWN_PLATFORM, 0);
     llvm::sys::SmartScopedWriter<true> lock(kernel_mutex);
@@ -194,7 +194,8 @@ public:
     }
     auto mod_or_err =
         createLLVMMod(fn, source, out_shapes, out_names, in_shapes, in_names,
-                      pyargv_strs, mode, lang, xla_runtime, pass_pipeline);
+                      pyargv_strs, mode, lang, xla_runtime, pass_pipeline,
+                      cpp_polygeist);
     if (!mod_or_err.ok()) {
       throw nanobind::value_error(mod_or_err.status().ToString().c_str());
     }
@@ -361,7 +362,8 @@ NB_MODULE(enzyme_call, m) {
            const nanobind::list &py_in_shapes, nanobind::object pyargv,
            ABI mode, Language lang, bool xla_runtime,
            const std::string &pass_pipeline,
-           const std::string &platform) -> std::tuple<size_t, size_t> {
+           const std::string &platform, bool cpp_polygeist)
+            -> std::tuple<size_t, size_t> {
           llvm::SmallVector<llvm::SmallVector<int64_t>> out_shapes;
           out_shapes.reserve(nanobind::len(py_out_shapes));
           llvm::SmallVector<llvm::SmallVector<int64_t>> in_shapes;
@@ -395,9 +397,10 @@ NB_MODULE(enzyme_call, m) {
               target.push_back(nanobind::cast<int64_t>(nested_element));
             }
           }
-          return CpuKernel::create(fn, source, out_shapes, out_types, in_shapes,
-                                   in_types, pyargv.ptr(), mode, (Language)lang,
-                                   xla_runtime, pass_pipeline, platform);
+          return CpuKernel::create(
+              fn, source, out_shapes, out_types, in_shapes, in_types,
+              pyargv.ptr(), mode, (Language)lang, xla_runtime, pass_pipeline,
+              platform, cpp_polygeist);
         });
 
   m.def("tmp_size",

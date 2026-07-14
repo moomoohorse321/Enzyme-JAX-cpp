@@ -84,6 +84,10 @@ class XLAPipeline:
         return self.exportname
 
 
+class CPPPolygeistPipeline(XLAPipeline):
+    pass
+
+
 class JaXPipeline:
     def __init__(self, passes=""):
         self.passes = passes
@@ -684,6 +688,7 @@ def _enzyme_primal_lowering(
                 pipeline_options.xla_runtime(),
                 pass_pipeline,
                 ctx.module_context.platforms[0],
+                False,
             )
             identifier_attr = jax_mlir.dense_int_elements([identifier])
             identifier_op = stablehlo.ConstantOp(identifier_attr)
@@ -725,6 +730,9 @@ def _enzyme_primal_lowering(
         results = tuple(results2)
     else:
         assert len(ctx.module_context.platforms) == 1
+        cpp_polygeist = lang == LANG_CPP and isinstance(
+            pipeline_options, CPPPolygeistPipeline
+        )
         identifier, tmpBuf = enzyme_call.create_enzyme_kernel(
             source,
             fn,
@@ -736,6 +744,7 @@ def _enzyme_primal_lowering(
             pipeline_options.xla_runtime(),
             pass_pipeline,
             ctx.module_context.platforms[0],
+            cpp_polygeist,
         )
         identifier_attr = jax_mlir.dense_int_elements([identifier])
         identifier_op = stablehlo.ConstantOp(identifier_attr)
@@ -810,6 +819,7 @@ def _enzyme_fwd_lowering(
         pipeline_options.xla_runtime(),
         pipeline_options.pass_pipeline(),
         ctx.module_context.platforms[0],
+        False,
     )
     identifier_attr = jax_mlir.dense_int_elements([identifier])
     identifier_op = stablehlo.ConstantOp(identifier_attr)
@@ -882,6 +892,7 @@ def _enzyme_aug_lowering(
         pipeline_options.xla_runtime(),
         pipeline_options.pass_pipeline(),
         ctx.module_context.platforms[0],
+        False,
     )
     identifier_attr = jax_mlir.dense_int_elements([identifier])
     identifier_op = stablehlo.ConstantOp(identifier_attr)
@@ -961,6 +972,7 @@ def _enzyme_rev_lowering(
         pipeline_options.xla_runtime(),
         pipeline_options.pass_pipeline(),
         ctx.module_context.platforms[0],
+        False,
     )
     identifier_attr = jax_mlir.dense_int_elements([identifier])
     identifier_op = stablehlo.ConstantOp(identifier_attr)
