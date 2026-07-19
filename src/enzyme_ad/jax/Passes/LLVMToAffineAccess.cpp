@@ -1658,70 +1658,6 @@ struct SimplifyDeadAlloc : public OpRewritePattern<T> {
   }
 };
 
-static bool definedOutsideOrAt(Value v, Operation *op) {
-  return !op->isProperAncestor(v.getParentBlock()->getParentOp());
-}
-
-template <typename T> struct SimpleMem2Reg : public OpRewritePattern<T> {
-  using OpRewritePattern<T>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(T alloc,
-                                PatternRewriter &rewriter) const override {
-    SmallVector<Value> stored;
-    SmallVector<Operation *> loads;
-    for (auto op : alloc->getUsers()) {
-      if (auto storeOp = dyn_cast<memref::StoreOp>(op)) {
-        if (storeOp.getValue() == alloc)
-          return failure();
-        stored.push_back(storeOp.getValue());
-        continue;
-      }
-      if (auto storeOp = dyn_cast<affine::AffineStoreOp>(op)) {
-        if (storeOp.getValue() == alloc)
-          return failure();
-        stored.push_back(storeOp.getValue());
-        continue;
-      }
-
-      if (isa<memref::DeallocOp>(op))
-        continue;
-
-      if (isa<LLVM::LifetimeStartOp>(op))
-        continue;
-
-      if (isa<LLVM::LifetimeEndOp>(op))
-        continue;
-
-      if (isa<affine::AffineLoadOp>(op) || isa<memref::LoadOp>(op)) {
-        loads.push_back(op);
-        continue;
-      }
-
-      LLVM_DEBUG(llvm::errs()
-                 << "Alloc is not simple mem2reg due to unknown user, alloc="
-                 << *alloc << " user = " << *op << "\n");
-
-      return failure();
-    }
-
-    if (loads.size() != 1 || stored.size() != 1)
-      return failure();
-
-    DominanceInfo DI(alloc->getParentOp());
-    bool changed = false;
-    for (auto load : loads) {
-      if (definedOutsideOrAt(stored[0], alloc->getParentOp()) ||
-          DI.dominates(stored[0], load)) {
-        rewriter.replaceOp(load, stored);
-        changed = true;
-        continue;
-      }
-    }
-
-    return success(changed);
-  }
-};
-
 namespace mlir {
 LogicalResult
 convertLLVMToAffineAccess(Operation *op,
@@ -1960,7 +1896,7 @@ convertLLVMToAffineAccess(Operation *op,
                     SimplifyDeadAlloc<memref::AllocOp>,
                     SimplifyDeadAlloc<LLVM::AllocaOp>,
                     SimplifyDeadAlloc<gpu::AllocOp, true>, Pointer2MemrefSelect,
-                    LoadSelect, SimpleMem2Reg<memref::AllocaOp>>(context);
+                    LoadSelect>(context);
     GreedyRewriteConfig config;
     config.enableFolding();
     if (applyPatternsGreedily(op, std::move(patterns), config).failed())
