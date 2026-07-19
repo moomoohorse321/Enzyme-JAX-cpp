@@ -564,10 +564,7 @@ void Memref2PointerOp::getCanonicalizationPatterns(RewritePatternSet &results,
   results.insert<
       // Memref2Pointer2MemrefCast, Memref2PointerIndex,
       // Memref2PointerBitCast,
-      Memref2Pointer2MemrefCast, Memref2PointerBitCast,
-
-      SetSimplification<LLVM::MemsetOp>, CopySimplification<LLVM::MemcpyOp>,
-      CopySimplification<LLVM::MemmoveOp>>(context);
+      Memref2Pointer2MemrefCast, Memref2PointerBitCast>(context);
 }
 
 OpFoldResult Memref2PointerOp::fold(FoldAdaptor adaptor) {
