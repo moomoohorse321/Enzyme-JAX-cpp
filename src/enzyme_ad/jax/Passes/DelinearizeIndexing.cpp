@@ -211,6 +211,16 @@ LogicalResult reshapeAtAddr(enzymexla::Pointer2MemrefOp &atAddr) {
     return failure();
   }
   MemRefType newMt = m2p.getSource().getType();
+  MemRefType accessMt = atAddr.getType();
+  if (accessMt.getRank() != 1 ||
+      accessMt.getElementType() != newMt.getElementType() ||
+      accessMt.getMemorySpace() != newMt.getMemorySpace() ||
+      !accessMt.getLayout().isIdentity() ||
+      !newMt.getLayout().isIdentity()) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "Failed: linear access view is incompatible with contract\n");
+    return failure();
+  }
   auto shape = newMt.getShape();
 
   // Only the first rank can be dynamic
