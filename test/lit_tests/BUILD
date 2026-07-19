@@ -13,7 +13,11 @@ load("@llvm-project//llvm:lit_test.bzl", "lit_test")
             "@llvm-project//llvm:count",
             "@llvm-project//llvm:not",
             "@stablehlo//:stablehlo-translate",
-        ] + glob(["**/*.h"]),
+        ] + (
+            ["//src/enzyme_ad/jax:raise.cpp"]
+            if src == "raising/production-memory-order.mlir"
+            else []
+        ) + glob(["**/*.h"]),
     )
     for src in glob(
         [
