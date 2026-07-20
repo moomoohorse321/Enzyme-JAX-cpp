@@ -974,6 +974,18 @@ struct AffineExprBuilder {
       return ext.getNonNeg();
     if (auto ext = dyn_cast<arith::ExtUIOp>(op))
       return ext.getNonNeg();
+    if (auto cast = dyn_cast<arith::IndexCastOp>(op)) {
+      auto sourceWidth = getIntegerBitwidth(cast.getIn().getType());
+      auto resultWidth = getIntegerBitwidth(cast.getType());
+      return sourceWidth && resultWidth && *sourceWidth <= *resultWidth;
+    }
+    if (auto cast = dyn_cast<arith::IndexCastUIOp>(op)) {
+      auto sourceWidth = getIntegerBitwidth(cast.getIn().getType());
+      auto resultWidth = getIntegerBitwidth(cast.getType());
+      if (!sourceWidth || !resultWidth || *sourceWidth > *resultWidth)
+        return false;
+      return *sourceWidth == *resultWidth || cast.getNonNeg();
+    }
     if (auto trunc = dyn_cast<LLVM::TruncOp>(op))
       return trunc.hasNoSignedWrap();
     if (auto trunc = dyn_cast<arith::TruncIOp>(op))
