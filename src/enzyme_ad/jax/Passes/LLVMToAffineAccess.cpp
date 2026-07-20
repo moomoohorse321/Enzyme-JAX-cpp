@@ -48,6 +48,7 @@
 #include "llvm/ADT/SmallVectorExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/Support/CheckedArithmetic.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/LogicalResult.h"
@@ -58,6 +59,7 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 
 #define DEBUG_TYPE "llvm-to-affine-access"
@@ -99,6 +101,33 @@ static std::optional<int64_t> getConstant(Value v) {
   if (op)
     return getConstant(op);
   return {};
+}
+
+static std::optional<llvm::APInt> getConstantAPInt(Value value) {
+  Operation *op = value.getDefiningOp();
+  if (auto cst = dyn_cast_or_null<arith::ConstantOp>(op)) {
+    if (auto intAttr = dyn_cast<IntegerAttr>(cst.getValue()))
+      return intAttr.getValue();
+  } else if (auto cst = dyn_cast_or_null<LLVM::ConstantOp>(op)) {
+    if (auto intAttr = dyn_cast<IntegerAttr>(cst.getValue()))
+      return intAttr.getValue();
+  }
+  return {};
+}
+
+static std::optional<uint64_t>
+getFixedTypeAllocationSize(Type type, const DataLayout &dataLayout) {
+  auto storeSize = dataLayout.getTypeSize(type);
+  if (storeSize.isScalable())
+    return {};
+  uint64_t alignment = dataLayout.getTypeABIAlignment(type);
+  if (alignment == 0)
+    return {};
+  auto paddedSize =
+      llvm::checkedAddUnsigned(storeSize.getFixedValue(), alignment - 1);
+  if (!paddedSize)
+    return {};
+  return (*paddedSize / alignment) * alignment;
 }
 
 template <typename FromAlloc, bool inPlace = false>
@@ -171,7 +200,7 @@ convertLLVMAllocaToMemrefAlloca(FromAlloc alloc, RewriterBase &rewriter,
 
   auto ptr2memref = p2ms[0];
   if constexpr (!inPlace) {
-    if (!getConstant(alloc.getArraySize())) {
+    if (!getConstantAPInt(alloc.getArraySize())) {
       auto memrefType = ptr2memref.getType();
       auto pointerType = cast<LLVM::LLVMPointerType>(alloc.getType());
       if (memrefType.getRank() != 1 || !memrefType.isDynamicDim(0) ||
@@ -209,14 +238,31 @@ convertLLVMAllocaToMemrefAlloca(FromAlloc alloc, RewriterBase &rewriter,
     }
   }
 
-  int64_t elNum;
+  uint64_t allocationSize;
   if constexpr (!inPlace) {
-    auto sizeVal = getConstant(alloc.getArraySize());
+    auto sizeVal = getConstantAPInt(alloc.getArraySize());
     if (!sizeVal)
       return failure();
 
-    elNum = dataLayout.getTypeSize(alloc.getElemType()) * (*sizeVal);
+    auto allocElementSize =
+        getFixedTypeAllocationSize(alloc.getElemType(), dataLayout);
+    if (!allocElementSize)
+      return failure();
+
+    allocationSize = 0;
+    if (*allocElementSize != 0) {
+      if (sizeVal->getActiveBits() > 64)
+        return failure();
+      // LLVM alloca array counts are unsigned, matching
+      // llvm::AllocaInst::getAllocationSize.
+      auto checkedSize = llvm::checkedMulUnsigned(
+          *allocElementSize, sizeVal->getZExtValue());
+      if (!checkedSize)
+        return failure();
+      allocationSize = *checkedSize;
+    }
   } else {
+    int64_t elNum;
     if (ptr2memref.getResult().getType().getElementType() ==
         alloc.getType().getElementType())
       return failure();
@@ -299,13 +345,31 @@ convertLLVMAllocaToMemrefAlloca(FromAlloc alloc, RewriterBase &rewriter,
     }
     elNum *= dataLayout.getTypeSize(
         cast<MemRefType>(alloc->getResult(0).getType()).getElementType());
+    if (elNum < 0)
+      return failure();
+    allocationSize = static_cast<uint64_t>(elNum);
   }
 
-  auto newElSize =
-      dataLayout.getTypeSize(ptr2memref.getResult().getType().getElementType());
-  int64_t newElnum = elNum / newElSize;
-  if (newElSize * newElnum != elNum)
+  uint64_t newElSize;
+  if constexpr (!inPlace) {
+    auto newElementSize = getFixedTypeAllocationSize(
+        ptr2memref.getResult().getType().getElementType(), dataLayout);
+    if (!newElementSize || *newElementSize == 0)
+      return failure();
+    newElSize = *newElementSize;
+  } else {
+    auto newElementSize = dataLayout.getTypeSize(
+        ptr2memref.getResult().getType().getElementType());
+    if (newElementSize.isScalable() || newElementSize.isZero())
+      return failure();
+    newElSize = newElementSize.getFixedValue();
+  }
+  uint64_t newElnumUnsigned = allocationSize / newElSize;
+  if (allocationSize % newElSize != 0 ||
+      newElnumUnsigned >
+          static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
     return failure();
+  int64_t newElnum = static_cast<int64_t>(newElnumUnsigned);
 
   MemRefType memrefType;
   if constexpr (!inPlace) {
