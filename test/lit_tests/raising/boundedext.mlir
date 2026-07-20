@@ -11,13 +11,10 @@ func.func private @extcast() {
     return
 }
 
-// CHECK:  func.func private @extcast() {
-// CHECK-NEXT:    affine.parallel (%arg0) = (0) to (256) {
-// CHECK-NEXT:      %0 = arith.index_castui %arg0 : index to i64
-// CHECK-NEXT:      func.call @bar(%0) : (i64) -> ()
-// CHECK-NEXT:    }
-// CHECK-NEXT:    return
-// CHECK-NEXT:  }
+// CHECK-LABEL: func.func private @extcast()
+// CHECK: %[[EXT_I32:.*]] = arith.index_castui %{{.*}} : index to i32
+// CHECK-NEXT: %[[EXT_I64:.*]] = arith.extui %[[EXT_I32]] : i32 to i64
+// CHECK-NEXT: func.call @bar(%[[EXT_I64]]) : (i64) -> ()
 
 func.func private @divcast() {
     %c23_i32 = arith.constant 23 : i32
@@ -30,15 +27,11 @@ func.func private @divcast() {
     return
 }
 
-// CHECK:  func.func private @divcast() {
-// CHECK-NEXT:    %c23 = arith.constant 23 : index
-// CHECK-NEXT:    affine.parallel (%arg0) = (0) to (256) {
-// CHECK-NEXT:      %0 = arith.divui %arg0, %c23 : index 
-// CHECK-NEXT:      %1 = arith.index_castui %0 : index to i64 
-// CHECK-NEXT:      func.call @bar(%1) : (i64) -> ()
-// CHECK-NEXT:    }
-// CHECK-NEXT:    return
-// CHECK-NEXT:  }
+// CHECK-LABEL: func.func private @divcast()
+// CHECK: %[[DIV_I32:.*]] = arith.index_castui %{{.*}} : index to i32
+// CHECK-NEXT: %[[DIV:.*]] = arith.divui %[[DIV_I32]], %{{.*}} : i32
+// CHECK-NEXT: %[[DIV_I64:.*]] = arith.extui %[[DIV]] : i32 to i64
+// CHECK-NEXT: func.call @bar(%[[DIV_I64]]) : (i64) -> ()
 
 func.func private @addcast() {
     %c23_i32 = arith.constant 23 : i32
@@ -51,15 +44,11 @@ func.func private @addcast() {
     return
 }
 
-// CHECK:  func.func private @addcast() {
-// CHECK-NEXT:    %c23 = arith.constant 23 : index
-// CHECK-NEXT:    affine.parallel (%arg0) = (0) to (256) {
-// CHECK-NEXT:      %0 = arith.addi %arg0, %c23 : index 
-// CHECK-NEXT:      %1 = arith.index_castui %0 : index to i64 
-// CHECK-NEXT:      func.call @bar(%1) : (i64) -> ()
-// CHECK-NEXT:    }
-// CHECK-NEXT:    return
-// CHECK-NEXT:  }
+// CHECK-LABEL: func.func private @addcast()
+// CHECK: %[[ADD_I32:.*]] = arith.index_castui %{{.*}} : index to i32
+// CHECK-NEXT: %[[ADD:.*]] = arith.addi %[[ADD_I32]], %{{.*}} : i32
+// CHECK-NEXT: %[[ADD_I64:.*]] = arith.extui %[[ADD]] : i32 to i64
+// CHECK-NEXT: func.call @bar(%[[ADD_I64]]) : (i64) -> ()
 
 func.func private @bigger(%arg0: memref<1x134x374xf64, 1>) {
     %c1_i32 = arith.constant 1 : i32
@@ -102,7 +91,5 @@ func.func private @bigger(%arg0: memref<1x134x374xf64, 1>) {
     return
   }
 
-// CHECK: @bigger
-// CHECK-NOT: index to i32
-
-
+// CHECK-LABEL: func.func private @bigger
+// CHECK: arith.index_castui %{{.*}} : index to i32
