@@ -52,6 +52,7 @@
 
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/MemRef/IR/MemRefMemorySlot.h"
 #include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
 #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -290,6 +291,8 @@ void loadAllRegisteredDialects(mlir::MLIRContext &context) {
 
 void registerInterfaces(mlir::DialectRegistry &registry) {
   mlir::enzyme::registerXLAAutoDiffInterfaces(registry);
+
+  mlir::memref::registerMemorySlotExternalModels(registry);
 
   mlir::func::registerInlinerExtension(registry);
   mlir::LLVM::registerInlinerInterface(registry);
