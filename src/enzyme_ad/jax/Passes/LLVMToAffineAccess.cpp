@@ -48,6 +48,7 @@
 #include "llvm/ADT/SmallVectorExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/Support/CheckedArithmetic.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/LogicalResult.h"
@@ -1722,6 +1723,77 @@ template <typename T> struct SimpleMem2Reg : public OpRewritePattern<T> {
   }
 };
 
+class StaticIdentityMemcpySimplification final
+    : public OpRewritePattern<LLVM::MemcpyOp> {
+public:
+  using OpRewritePattern<LLVM::MemcpyOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(LLVM::MemcpyOp op,
+                                PatternRewriter &rewriter) const override {
+    if (op.getIsVolatile())
+      return failure();
+
+    auto dst = op.getDst().getDefiningOp<enzymexla::Memref2PointerOp>();
+    auto src = op.getSrc().getDefiningOp<enzymexla::Memref2PointerOp>();
+    if (!dst || !src)
+      return failure();
+
+    auto dstTy = dyn_cast<MemRefType>(dst.getSource().getType());
+    auto srcTy = dyn_cast<MemRefType>(src.getSource().getType());
+    if (!dstTy || dstTy != srcTy || !dstTy.hasStaticShape() ||
+        !dstTy.getLayout().isIdentity())
+      return failure();
+
+    Type elementTy = dstTy.getElementType();
+    unsigned elementBitWidth;
+    if (auto intTy = dyn_cast<IntegerType>(elementTy))
+      elementBitWidth = intTy.getWidth();
+    else if (auto floatTy = dyn_cast<FloatType>(elementTy))
+      elementBitWidth = floatTy.getWidth();
+    else
+      return failure();
+    if (elementBitWidth == 0 || elementBitWidth % 8 != 0)
+      return failure();
+
+    // memref.copy transfers logical element values, while LLVM memcpy also
+    // transfers padding bytes. Only convert when the store size is already a
+    // multiple of the ABI alignment, so the LLVM allocation stride adds no
+    // observable per-element padding.
+    DataLayout dataLayout = DataLayout::closest(op);
+    llvm::TypeSize storeSize = dataLayout.getTypeSize(elementTy);
+    if (storeSize.isScalable())
+      return failure();
+    uint64_t storageBytes = storeSize.getFixedValue();
+    uint64_t abiAlignment = dataLayout.getTypeABIAlignment(elementTy);
+    if (storageBytes == 0 || abiAlignment == 0 ||
+        storageBytes % abiAlignment != 0)
+      return failure();
+
+    uint64_t totalBytes = storageBytes;
+    for (int64_t dim : dstTy.getShape()) {
+      auto product = llvm::checkedMulUnsigned(totalBytes,
+                                              static_cast<uint64_t>(dim));
+      if (!product)
+        return failure();
+      totalBytes = *product;
+    }
+
+    IntegerAttr lenAttr;
+    if (!matchPattern(op.getLen(), m_Constant(&lenAttr)))
+      return failure();
+    const APInt &len = lenAttr.getValue();
+    if (len.getActiveBits() > 64 || len.getZExtValue() != totalBytes)
+      return failure();
+
+    // LLVM memcpy already requires the ranges not to overlap. For identical
+    // contiguous memrefs, copying all bytes is exactly a whole-buffer copy.
+    memref::CopyOp::create(rewriter, op.getLoc(), src.getSource(),
+                           dst.getSource());
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 namespace mlir {
 LogicalResult
 convertLLVMToAffineAccess(Operation *op,
@@ -1953,6 +2025,7 @@ convertLLVMToAffineAccess(Operation *op,
                                                         dataLayoutAnalysis);
     patterns.insert<IndexCastAddSub, MemrefLoadAffineApply, SelectCSE,
                     SelectAddrCast>(context);
+    patterns.insert<StaticIdentityMemcpySimplification>(context);
     patterns.insert<SimplifyAllocConst<memref::AllocOp>,
                     SimplifyAllocConst<memref::AllocaOp>,
                     SimplifyAllocConst<gpu::AllocOp, true>>(context);
