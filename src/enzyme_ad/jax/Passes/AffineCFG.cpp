@@ -1,4 +1,5 @@
 #include "Enzyme/MLIR/Dialect/Ops.h"
+#include "mlir/Analysis/DataLayoutAnalysis.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
@@ -14,6 +15,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/Transforms/WalkPatternRewriteDriver.h"
 #include "src/enzyme_ad/jax/Passes/AffineUtils.h"
 #include "src/enzyme_ad/jax/Passes/Passes.h"
 #include "llvm/ADT/SmallSet.h"
@@ -27,6 +29,7 @@
 #include <isl/set.h>
 #include <isl/val.h>
 #include <numeric>
+#include <type_traits>
 
 #define DEBUG_TYPE "affine-cfg"
 
@@ -1168,6 +1171,94 @@ struct CanonicalizeAffineApply
   }
 };
 
+static unsigned getTargetIndexBitWidth(Operation *op) {
+  llvm::TypeSize width = DataLayout::closest(op).getTypeSizeInBits(
+      IndexType::get(op->getContext()));
+  assert(!width.isScalable() && "index types must have a fixed bit width");
+  return width.getFixedValue();
+}
+
+static std::optional<unsigned> getIndexCastElementBitWidth(Type type,
+                                                            Operation *op) {
+  Type elementType = getElementTypeOrSelf(type);
+  if (auto integerType = dyn_cast<IntegerType>(elementType))
+    return integerType.getWidth();
+  if (isa<IndexType>(elementType))
+    return getTargetIndexBitWidth(op);
+  return std::nullopt;
+}
+
+static Type cloneWithIntegerElement(Type type, unsigned width) {
+  Type integerType = IntegerType::get(type.getContext(), width);
+  if (isa<IntegerType, IndexType>(type))
+    return integerType;
+  if (auto shapedType = dyn_cast<ShapedType>(type)) {
+    if (!isa<BaseMemRefType>(type))
+      return shapedType.clone(integerType);
+  }
+  return {};
+}
+
+static Value resizeInteger(PatternRewriter &rewriter, Location loc, Value value,
+                           Type resultType, unsigned sourceWidth,
+                           unsigned resultWidth, bool isUnsigned) {
+  if (sourceWidth > resultWidth)
+    return TruncIOp::create(rewriter, loc, resultType, value);
+  if (isUnsigned)
+    return ExtUIOp::create(rewriter, loc, resultType, value);
+  return ExtSIOp::create(rewriter, loc, resultType, value);
+}
+
+// Normalize the integer side of an index cast to the target index width.  The
+// generic arith folder models index as its 64-bit internal storage type, so an
+// explicit resize is required before it may fold casts for a 32-bit target.
+template <typename T>
+struct NormalizeIndexCastWidth : public OpRewritePattern<T> {
+  using OpRewritePattern<T>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(T indexcastOp,
+                                PatternRewriter &rewriter) const override {
+    Type sourceType = indexcastOp.getOperand().getType();
+    Type resultType = indexcastOp.getType();
+    Type sourceElementType = getElementTypeOrSelf(sourceType);
+    Type resultElementType = getElementTypeOrSelf(resultType);
+    unsigned indexWidth = getTargetIndexBitWidth(indexcastOp);
+    if (indexWidth == IndexType::kInternalStorageBitWidth)
+      return failure();
+    constexpr bool isUnsigned = std::is_same<T, IndexCastUIOp>::value;
+
+    if (auto sourceIntegerType = dyn_cast<IntegerType>(sourceElementType)) {
+      unsigned sourceWidth = sourceIntegerType.getWidth();
+      if (sourceWidth == indexWidth)
+        return failure();
+      Type resizedType = cloneWithIntegerElement(sourceType, indexWidth);
+      if (!resizedType)
+        return failure();
+      Value resized = resizeInteger(rewriter, indexcastOp.getLoc(),
+                                    indexcastOp.getOperand(), resizedType,
+                                    sourceWidth, indexWidth, isUnsigned);
+      rewriter.replaceOpWithNewOp<T>(indexcastOp, resultType, resized);
+      return success();
+    }
+
+    auto resultIntegerType = dyn_cast<IntegerType>(resultElementType);
+    if (!resultIntegerType || resultIntegerType.getWidth() == indexWidth)
+      return failure();
+    Type indexWidthIntegerType =
+        cloneWithIntegerElement(resultType, indexWidth);
+    if (!indexWidthIntegerType)
+      return failure();
+    Value normalized = T::create(rewriter, indexcastOp.getLoc(),
+                                 indexWidthIntegerType,
+                                 indexcastOp.getOperand());
+    Value resized = resizeInteger(
+        rewriter, indexcastOp.getLoc(), normalized, resultType, indexWidth,
+        resultIntegerType.getWidth(), isUnsigned);
+    rewriter.replaceOp(indexcastOp, resized);
+    return success();
+  }
+};
+
 template <typename T>
 struct CanonicalizeIndexCast : public OpRewritePattern<T> {
   using OpRewritePattern<T>::OpRewritePattern;
@@ -1176,19 +1267,36 @@ struct CanonicalizeIndexCast : public OpRewritePattern<T> {
                                 PatternRewriter &rewriter) const override {
 
     // Fold IndexCast(IndexCast(x)) -> x
-    auto cast = indexcastOp.getOperand().template getDefiningOp<T>();
-    if (cast && cast.getOperand().getType() == indexcastOp.getType()) {
-      mlir::Value vals[] = {cast.getOperand()};
+    auto innerCast = indexcastOp.getOperand().template getDefiningOp<T>();
+    if (innerCast &&
+        innerCast.getOperand().getType() == indexcastOp.getType()) {
+      auto sourceWidth =
+          getIndexCastElementBitWidth(innerCast.getOperand().getType(),
+                                      indexcastOp);
+      auto intermediateWidth =
+          getIndexCastElementBitWidth(innerCast.getType(), indexcastOp);
+      if (!sourceWidth || !intermediateWidth ||
+          *intermediateWidth < *sourceWidth)
+        return failure();
+      mlir::Value vals[] = {innerCast.getOperand()};
       rewriter.replaceOp(indexcastOp, vals);
       return success();
     }
 
-    // Fold IndexCast(constant) -> constant
-    // A little hack because we go through int.  Otherwise, the size
-    // of the constant might need to change.
+    // Only materialize a target-width value. Otherwise the integer-to-index
+    // conversion still has a target-dependent truncate or extend to perform.
     if (auto cst =
             indexcastOp.getOperand().template getDefiningOp<ConstantIntOp>()) {
-      rewriter.replaceOpWithNewOp<ConstantIndexOp>(indexcastOp, cst.value());
+      auto sourceWidth =
+          getIndexCastElementBitWidth(cst.getType(), indexcastOp);
+      unsigned indexWidth = getTargetIndexBitWidth(indexcastOp);
+      if (!sourceWidth || *sourceWidth != indexWidth || indexWidth > 64)
+        return failure();
+      APInt value = cast<IntegerAttr>(cst.getValue()).getValue();
+      value = std::is_same<T, IndexCastUIOp>::value ? value.zextOrTrunc(64)
+                                                   : value.sextOrTrunc(64);
+      rewriter.replaceOpWithNewOp<ConstantIndexOp>(indexcastOp,
+                                                    value.getSExtValue());
       return success();
     }
     return failure();
@@ -6206,6 +6314,15 @@ void mlir::enzyme::populateAffineCFGPatterns(RewritePatternSet &rpl) {
 }
 
 void AffineCFGPass::runOnOperation() {
+  // Rewrite index casts through an integer with the target index width before
+  // the folding-enabled greedy driver applies arith's target-independent fold.
+  mlir::RewritePatternSet indexCastNormalization(
+      getOperation()->getContext());
+  indexCastNormalization
+      .add<NormalizeIndexCastWidth<IndexCastOp>,
+           NormalizeIndexCastWidth<IndexCastUIOp>>(getOperation()->getContext());
+  walkAndApplyPatterns(getOperation(), std::move(indexCastNormalization));
+
   mlir::RewritePatternSet rpl(getOperation()->getContext());
   populateAffineCFGPatterns(rpl);
   populateAffineParallelizationPattern(*getOperation()->getContext(), rpl);
