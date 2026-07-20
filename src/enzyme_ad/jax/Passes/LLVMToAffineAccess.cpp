@@ -1820,21 +1820,33 @@ convertLLVMToAffineAccess(Operation *op,
     Operation *access = builder->user;
     Operation *function = getTransactionRoot(access);
     Type elementType;
+    std::optional<uint64_t> alignment;
     if (auto load = dyn_cast<LLVM::LoadOp>(access)) {
       if (load.getVolatile_() ||
           load.getOrdering() != LLVM::AtomicOrdering::not_atomic)
         unsupportedFunctions.insert(function);
       elementType = load.getType();
+      alignment = load.getAlignment();
     } else if (auto store = dyn_cast<LLVM::StoreOp>(access)) {
       if (store.getVolatile_() ||
           store.getOrdering() != LLVM::AtomicOrdering::not_atomic)
         unsupportedFunctions.insert(function);
       elementType = store.getValue().getType();
+      alignment = store.getAlignment();
     } else {
       llvm_unreachable("Unknown operation to raise");
     }
 
     if (!MemRefType::isValidElementType(elementType)) {
+      unsupportedFunctions.insert(function);
+      continue;
+    }
+
+    // LowerAffine drops access attributes, after which LLVM lowering defaults
+    // to the ABI alignment. Do not silently strengthen a weaker contract.
+    if (alignment && *alignment != 0 &&
+        *alignment < dataLayoutAnalysis.getAtOrAbove(access)
+                         .getTypeABIAlignment(elementType)) {
       unsupportedFunctions.insert(function);
       continue;
     }
