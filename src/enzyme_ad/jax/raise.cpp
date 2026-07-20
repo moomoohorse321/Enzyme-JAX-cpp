@@ -180,7 +180,7 @@ std::string runLLVMToMLIRRoundTripImpl(
   if (arguments.empty())
     pass_pipeline += "llvm-to-memref-access,";
   pass_pipeline +=
-      "polygeist-mem2reg,canonicalize,convert-llvm-to-cf,"
+      "sroa,mem2reg,polygeist-mem2reg,canonicalize,convert-llvm-to-cf,"
       "canonicalize,polygeist-mem2reg,canonicalize,enzyme-lift-cf-to-scf,"
       "canonicalize,"
       "func.func(canonicalize-loops),"

@@ -3,6 +3,12 @@ load("@bazel_skylib//rules:expand_template.bzl", "expand_template")
 load("@llvm-project//llvm:lit_test.bzl", "lit_test", "package_path")
 load("@rules_python//python:py_test.bzl", "py_test")
 
+cc_test(
+    name = "raise_standard_mem2reg_test",
+    srcs = ["raise_standard_mem2reg_test.cpp"],
+    deps = ["//:RaiseLib"],
+)
+
 expand_template(
     name = "lit_site_cfg_py",
     testonly = True,
