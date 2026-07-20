@@ -531,6 +531,9 @@ struct ConvertLLVMAllocaToMemrefAlloca
 
   LogicalResult matchAndRewrite(LLVM::AllocaOp alloc,
                                 PatternRewriter &rewriter) const override {
+    if (alloc.getInalloca())
+      return rewriter.notifyMatchFailure(
+          alloc, "inalloca semantics cannot be represented by memref.alloca");
     auto dataLayout = dl.getAtOrAbove(alloc);
     return convertLLVMAllocaToMemrefAlloca(alloc, rewriter, dataLayout);
   }
