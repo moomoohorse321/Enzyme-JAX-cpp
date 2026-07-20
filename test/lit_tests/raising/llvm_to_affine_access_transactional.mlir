@@ -1,22 +1,59 @@
 // RUN: enzymexlamlir-opt %s --pass-pipeline="builtin.module(llvm-to-affine-access,canonicalize,func.func(affine-scalrep),canonicalize)" --split-input-file | FileCheck %s
 // RUN: enzymexlamlir-opt %s --pass-pipeline="builtin.module(llvm-to-affine-access)" --split-input-file | FileCheck %s --check-prefix=RAW
 
-// A low declared alignment does not prevent raising when the typed root and
-// byte offset prove an element-aligned access.
-// CHECK-LABEL: func.func @proven_under_aligned(
-// CHECK-NOT:     llvm.load
-// CHECK-NOT:     llvm.store
+// Affine-to-standard drops access attributes, so raising a weakly aligned
+// access would strengthen it to the ABI alignment during LLVM lowering.
+// CHECK-LABEL: func.func @weak_alignment(
+// CHECK-NOT:     affine.load
+// CHECK-NOT:     affine.store
 // CHECK-NOT:     enzymexla.pointer2memref
-// CHECK:         affine.store %arg1, %arg0[symbol(%arg2)] {alignment = 1 : i64
-// CHECK:         return %arg1 : i64
-func.func @proven_under_aligned(%storage: memref<8xi64, 1>, %value: i64,
-                                %i: index) -> i64 {
+// CHECK:         llvm.store %arg1, %{{.*}} {alignment = 1 : i64}
+// CHECK:         %[[LOADED:.*]] = llvm.load %{{.*}} {alignment = 1 : i64}
+// CHECK:         return %[[LOADED]] : i64
+// RAW-LABEL: func.func @weak_alignment(
+// RAW-NOT:     affine.load
+// RAW-NOT:     affine.store
+// RAW-NOT:     enzymexla.pointer2memref
+// RAW:         llvm.store %arg1, %{{.*}} {alignment = 1 : i64}
+// RAW:         %[[RAW_LOADED:.*]] = llvm.load %{{.*}} {alignment = 1 : i64}
+// RAW:         return %[[RAW_LOADED]] : i64
+module attributes {dlti.dl_spec = #dlti.dl_spec<i64 = dense<64> : vector<2xi64>>} {
+func.func @weak_alignment(%storage: memref<8xi64, 1>, %value: i64,
+                          %i: index) -> i64 {
   %ptr = "enzymexla.memref2pointer"(%storage) : (memref<8xi64, 1>) -> !llvm.ptr<1>
   %i64 = arith.index_cast %i : index to i64
   %address = llvm.getelementptr inbounds %ptr[%i64] : (!llvm.ptr<1>, i64) -> !llvm.ptr<1>, i64
   llvm.store %value, %address {alignment = 1 : i64} : i64, !llvm.ptr<1>
   %loaded = llvm.load %address {alignment = 1 : i64} : !llvm.ptr<1> -> i64
   return %loaded : i64
+}
+}
+
+// -----
+
+// Natural and stronger explicit alignments are no weaker than the downstream
+// ABI default, so they remain eligible for affine raising.
+// CHECK-LABEL: func.func @abi_or_stronger_alignment(
+// CHECK-NOT:     llvm.load
+// CHECK-NOT:     llvm.store
+// CHECK:         affine.store %arg1, %arg0[symbol(%arg2)] {alignment = 16 : i64
+// CHECK:         return %arg1 : i64
+// RAW-LABEL: func.func @abi_or_stronger_alignment(
+// RAW-NOT:     llvm.load
+// RAW-NOT:     llvm.store
+// RAW:         affine.store %arg1, %{{.*}}[symbol(%{{.*}})] {alignment = 16 : i64
+// RAW:         %[[RAW_ALIGNED:.*]] = affine.load %{{.*}}[symbol(%{{.*}})] {alignment = 8 : i64
+// RAW:         return %[[RAW_ALIGNED]] : i64
+module attributes {dlti.dl_spec = #dlti.dl_spec<i64 = dense<64> : vector<2xi64>>} {
+func.func @abi_or_stronger_alignment(%storage: memref<8xi64, 1>, %value: i64,
+                                     %i: index) -> i64 {
+  %ptr = "enzymexla.memref2pointer"(%storage) : (memref<8xi64, 1>) -> !llvm.ptr<1>
+  %i64 = arith.index_cast %i : index to i64
+  %address = llvm.getelementptr inbounds %ptr[%i64] : (!llvm.ptr<1>, i64) -> !llvm.ptr<1>, i64
+  llvm.store %value, %address {alignment = 16 : i64} : i64, !llvm.ptr<1>
+  %loaded = llvm.load %address {alignment = 8 : i64} : !llvm.ptr<1> -> i64
+  return %loaded : i64
+}
 }
 
 // -----
