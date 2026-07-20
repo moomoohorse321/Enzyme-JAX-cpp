@@ -196,7 +196,9 @@ std::string runLLVMToMLIRRoundTripImpl(
       // LICM does not check aliases for memory ops, so use generic LICM, which
       // only hoists pure, speculatable operations.
       "func.func(loop-invariant-code-motion),"
-      "canonicalize,sort-memory,llvm-to-tessera,tessera-apply-pdl,tessera-to-llvm,";
+      // sort-memory cannot safely reorder potentially aliasing raised views or
+      // move accesses across unknown effects, so do not run it here.
+      "canonicalize,llvm-to-tessera,tessera-apply-pdl,tessera-to-llvm,";
   if (StringRef(backend).starts_with("xla")) {
       pass_pipeline += "func.func(kernelcast),raise-affine-to-stablehlo{prefer_while_raising=false "
       "dump_failed_lockstep=true},canonicalize,arith-raise{stablehlo=true},"
