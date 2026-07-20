@@ -587,6 +587,11 @@ OpFoldResult Memref2PointerOp::fold(FoldAdaptor adaptor) {
     return getResult();
   }
   if (auto mc = getSource().getDefiningOp<enzymexla::Pointer2MemrefOp>()) {
+    auto memrefType = cast<MemRefType>(mc.getType());
+    int64_t offset;
+    SmallVector<int64_t> strides;
+    if (failed(memrefType.getStridesAndOffset(strides, offset)) || offset != 0)
+      return nullptr;
     if (mc.getSource().getType() == getType()) {
       return mc.getSource();
     }
@@ -624,6 +629,11 @@ public:
       return failure();
 
     if (src.getSource().getType() != op.getType())
+      return failure();
+    auto memrefType = cast<MemRefType>(src.getType());
+    int64_t offset;
+    SmallVector<int64_t> strides;
+    if (failed(memrefType.getStridesAndOffset(strides, offset)) || offset != 0)
       return failure();
 
     rewriter.replaceOpWithNewOp<LLVM::BitcastOp>(op, op.getType(),
