@@ -56,13 +56,43 @@ func.func @volatile_memcpy(%dst: memref<4xi32>, %src: memref<4xi32>) {
 
 // -----
 
-// Disable even the safe-looking zero-fill subset because the same ad-hoc
-// expansion family crashes on other valid memref shapes and element types.
+// A complete all-zero byte fill of a static integer memref is equivalent to
+// storing the typed integer zero into every element.
 // CHECK-LABEL: func.func @zero_memset(
+// CHECK:         %[[ZERO:.*]] = arith.constant 0 : i32
+// CHECK:         linalg.fill ins(%[[ZERO]] : i32) outs(%arg0 : memref<2x2xi32>)
+// CHECK-NOT:     "llvm.intr.memset"
+func.func @zero_memset(%dst: memref<2x2xi32>) {
+  %ptr = "enzymexla.memref2pointer"(%dst) : (memref<2x2xi32>) -> !llvm.ptr
+  %value = llvm.mlir.constant(0 : i8) : i8
+  %size = llvm.mlir.constant(16 : i64) : i64
+  "llvm.intr.memset"(%ptr, %value, %size) <{isVolatile = false}> : (!llvm.ptr, i8, i64) -> ()
+  return
+}
+
+// -----
+
+// A partial byte range cannot be replaced by a whole-buffer typed fill.
+// CHECK-LABEL: func.func @partial_zero_memset(
 // CHECK-NOT:     scf.for
 // CHECK:         "llvm.intr.memset"({{.*}}) <{isVolatile = false}>
-func.func @zero_memset(%dst: memref<4xi32>) {
+func.func @partial_zero_memset(%dst: memref<4xi32>) {
   %ptr = "enzymexla.memref2pointer"(%dst) : (memref<4xi32>) -> !llvm.ptr
+  %value = arith.constant 0 : i8
+  %size = arith.constant 8 : i64
+  "llvm.intr.memset"(%ptr, %value, %size) <{isVolatile = false}> : (!llvm.ptr, i8, i64) -> ()
+  return
+}
+
+// -----
+
+// Keep floating-point memset bytewise: not every builtin floating format has
+// a typed zero whose representation is proven to be all-zero bytes.
+// CHECK-LABEL: func.func @floating_zero_memset(
+// CHECK-NOT:     scf.for
+// CHECK:         "llvm.intr.memset"({{.*}}) <{isVolatile = false}>
+func.func @floating_zero_memset(%dst: memref<4xf32>) {
+  %ptr = "enzymexla.memref2pointer"(%dst) : (memref<4xf32>) -> !llvm.ptr
   %value = arith.constant 0 : i8
   %size = arith.constant 16 : i64
   "llvm.intr.memset"(%ptr, %value, %size) <{isVolatile = false}> : (!llvm.ptr, i8, i64) -> ()
