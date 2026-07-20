@@ -827,6 +827,7 @@ struct AffineExprBuilder {
   DenseMap<Value, unsigned> dimToPos;
   SmallVector<Value> symbolOperands;
   SmallVector<Value> dimOperands;
+  SmallVector<Operation *> indexMaterializations;
 
   // Options
   bool legalizeSymbols;
@@ -838,6 +839,14 @@ struct AffineExprBuilder {
   bool isLegal() {
     return illegalSymbols.size() == 0 ||
            (illegalSymbols.size() == scopedIllegalSymbols && scoped);
+  }
+
+  void cleanupIndexMaterializations() {
+    for (Operation *materialization : llvm::reverse(indexMaterializations)) {
+      if (materialization->use_empty())
+        materialization->erase();
+    }
+    indexMaterializations.clear();
   }
 
   void collectSymbolsForScope(Region *region, SmallPtrSetImpl<Value> &symbols) {
@@ -942,8 +951,12 @@ struct AffineExprBuilder {
     if (!isIndexTy)
       v = convertToIndex(v);
     if (affine::isValidSymbol(v)) {
+      if (!isIndexTy)
+        indexMaterializations.push_back(v.getDefiningOp());
       return getAffineSymbolExpr(getSymbolPosition(v), v.getContext());
     } else if (affine::isValidDim(v)) {
+      if (!isIndexTy)
+        indexMaterializations.push_back(v.getDefiningOp());
       return getAffineDimExpr(getDimPosition(v), v.getContext());
     }
     if (!isIndexTy) {
@@ -1673,6 +1686,7 @@ convertLLVMToAffineAccess(Operation *op,
   IndexConverter ic;
 
   SmallVector<std::unique_ptr<AffineAccessBuilder>> accessBuilders;
+  SmallVector<bool> accessBuilt;
   auto handleOp = [&](Operation *op, PtrVal addr) {
     LLVM_DEBUG(llvm::dbgs() << "Building affine access for " << op
                             << " for address " << addr << "\n");
@@ -1680,7 +1694,7 @@ convertLLVMToAffineAccess(Operation *op,
         std::make_unique<AffineAccessBuilder>(op, legalizeSymbols));
     AffineAccessBuilder &aab = *accessBuilders.back();
     auto dl = dataLayoutAnalysis.getAtOrAbove(op);
-    (void)aab.build(dl, addr);
+    accessBuilt.push_back(succeeded(aab.build(dl, addr)));
   };
   op->walk([&](LLVM::StoreOp store) {
     PtrVal addr = store.getAddr();
@@ -1728,16 +1742,59 @@ convertLLVMToAffineAccess(Operation *op,
     }
   }
 
-  IRMapping mapping;
-  for (auto &aabp : accessBuilders) {
-    AffineAccessBuilder &aab = *aabp;
-    // TODO add a test where some operations are left illegal
+  auto getTransactionRoot = [op](Operation *access) {
+    if (auto function = access->getParentOfType<FunctionOpInterface>())
+      return function.getOperation();
+    return op;
+  };
 
-    auto isAligned = [&](auto op, llvm::TypeSize tySize) {
-      if (auto alignment = op.getAlignment())
-        return *alignment % tySize == 0;
-      return false;
-    };
+  SmallPtrSet<Operation *, 8> unsupportedFunctions;
+  SmallVector<bool> affineConvertible(accessBuilders.size(), false);
+  for (auto [index, builder] : llvm::enumerate(accessBuilders)) {
+    Operation *access = builder->user;
+    Operation *function = getTransactionRoot(access);
+    Type elementType;
+    if (auto load = dyn_cast<LLVM::LoadOp>(access)) {
+      if (load.getVolatile_() ||
+          load.getOrdering() != LLVM::AtomicOrdering::not_atomic)
+        unsupportedFunctions.insert(function);
+      elementType = load.getType();
+    } else if (auto store = dyn_cast<LLVM::StoreOp>(access)) {
+      if (store.getVolatile_() ||
+          store.getOrdering() != LLVM::AtomicOrdering::not_atomic)
+        unsupportedFunctions.insert(function);
+      elementType = store.getValue().getType();
+    } else {
+      llvm_unreachable("Unknown operation to raise");
+    }
+
+    if (!MemRefType::isValidElementType(elementType)) {
+      unsupportedFunctions.insert(function);
+      continue;
+    }
+
+    AffineAccessBuilder &affine = *builder;
+    if (!accessBuilt[index] || !affine.isLegal())
+      continue;
+
+    auto dl = dataLayoutAnalysis.getAtOrAbove(access);
+    llvm::TypeSize elementSize = dl.getTypeSize(elementType);
+    if (elementSize.isScalable() || elementSize.getFixedValue() == 0 ||
+        !affine.expr.isMultipleOf(elementSize.getFixedValue()))
+      unsupportedFunctions.insert(function);
+    else
+      affineConvertible[index] = true;
+  }
+
+  IRMapping mapping;
+  for (auto [index, aabp] : llvm::enumerate(accessBuilders)) {
+    AffineAccessBuilder &aab = *aabp;
+    if (unsupportedFunctions.contains(getTransactionRoot(aab.user))) {
+      aab.cleanupIndexMaterializations();
+      continue;
+    }
+
+    // TODO add a test where some operations are left illegal
 
     auto dl = dataLayoutAnalysis.getAtOrAbove(aab.user);
     if (auto load = dyn_cast<LLVM::LoadOp>(aab.user)) {
@@ -1766,8 +1823,7 @@ convertLLVMToAffineAccess(Operation *op,
         }
 
         auto mao = aab.getMap();
-        if (mao.map.getResult(0).isMultipleOf(tySize) ||
-            isAligned(load, tySize)) {
+        if (affineConvertible[index]) {
           auto expr = mao.map.getResult(0).floorDiv(tySize);
           SmallVector<NamedAttribute> attrs(load->getAttrs().begin(),
                                             load->getAttrs().end());
@@ -1785,6 +1841,7 @@ convertLLVMToAffineAccess(Operation *op,
           for (auto attr : attrs) {
             newLoad->setAttr(attr.getName(), attr.getValue());
           }
+          aab.cleanupIndexMaterializations();
           continue;
         }
       }
@@ -1812,6 +1869,7 @@ convertLLVMToAffineAccess(Operation *op,
       for (auto attr : attrs) {
         newLoad->setAttr(attr.getName(), attr.getValue());
       }
+      aab.cleanupIndexMaterializations();
 
     } else if (auto store = dyn_cast<LLVM::StoreOp>(aab.user)) {
       Type ty = store.getValue().getType();
@@ -1837,8 +1895,7 @@ convertLLVMToAffineAccess(Operation *op,
                        .getResult();
         }
         auto mao = aab.getMap();
-        if (mao.map.getResult(0).isMultipleOf(tySize) ||
-            isAligned(store, tySize)) {
+        if (affineConvertible[index]) {
           assert(cast<MemRefType>(memref.getType()).getElementType() ==
                  store.getValue().getType());
           auto expr = mao.map.getResult(0).floorDiv(tySize);
@@ -1853,6 +1910,7 @@ convertLLVMToAffineAccess(Operation *op,
             newStore->setAttr(attr.getName(), attr.getValue());
           }
         }
+        aab.cleanupIndexMaterializations();
         continue;
       }
 
@@ -1873,6 +1931,7 @@ convertLLVMToAffineAccess(Operation *op,
       for (auto attr : attrs) {
         newStore->setAttr(attr.getName(), attr.getValue());
       }
+      aab.cleanupIndexMaterializations();
     } else {
       llvm_unreachable("Unknown operation to raise");
     }
