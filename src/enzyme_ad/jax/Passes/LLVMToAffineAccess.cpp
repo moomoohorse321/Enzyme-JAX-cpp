@@ -1567,9 +1567,32 @@ template <typename T, bool gpu = false>
 struct SimplifyDeadAlloc : public OpRewritePattern<T> {
   using OpRewritePattern<T>::OpRewritePattern;
 
+  static bool hasObservableStoreSemantics(Operation *op) {
+    if (auto store = dyn_cast<LLVM::StoreOp>(op))
+      return store.getVolatile_() ||
+             store.getOrdering() != LLVM::AtomicOrdering::not_atomic;
+
+    // LLVM stores raised earlier in this pass retain these attributes on the
+    // resulting memref or affine store.
+    if (op->hasAttr("volatile_"))
+      return true;
+
+    Attribute ordering = op->getAttr("ordering");
+    if (!ordering)
+      return false;
+    auto integerOrdering = dyn_cast<IntegerAttr>(ordering);
+    return !integerOrdering || integerOrdering.getInt() !=
+                                   static_cast<int64_t>(
+                                       LLVM::AtomicOrdering::not_atomic);
+  }
+
   LogicalResult matchAndRewrite(T alloc,
                                 PatternRewriter &rewriter) const override {
     for (auto op : alloc->getResult(0).getUsers()) {
+      if (isa<memref::StoreOp, LLVM::StoreOp, affine::AffineStoreOp>(op) &&
+          hasObservableStoreSemantics(op))
+        return failure();
+
       if (auto storeOp = dyn_cast<memref::StoreOp>(op)) {
         if (storeOp.getValue() == alloc->getResult(0))
           return failure();
