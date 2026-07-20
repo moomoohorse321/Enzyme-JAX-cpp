@@ -502,6 +502,24 @@ static Value convertToIndex(Value v) {
       .getResult();
 }
 
+static bool hasAffineCompatibleGEPIndexWidths(const DataLayout &dataLayout,
+                                              LLVM::GEPOp gep) {
+  auto pointerIndexBitwidth =
+      dataLayout.getTypeIndexBitwidth(gep.getBase().getType());
+  if (!pointerIndexBitwidth)
+    return false;
+  for (Value index : gep.getDynamicIndices()) {
+    auto integerType = dyn_cast<IntegerType>(index.getType());
+    if (!integerType || integerType.getWidth() > *pointerIndexBitwidth) {
+      // LLVM truncates wider GEP indices to the address-space-specific
+      // pointer index width. Index-typed affine arithmetic cannot represent
+      // that value-dependent truncation.
+      return false;
+    }
+  }
+  return true;
+}
+
 struct GEPOfMemRefLoad : public OpRewritePattern<memref::LoadOp> {
   using OpRewritePattern<memref::LoadOp>::OpRewritePattern;
   const DataLayoutAnalysis &dl;
@@ -518,6 +536,8 @@ struct GEPOfMemRefLoad : public OpRewritePattern<memref::LoadOp> {
       return failure();
     auto gep = ptr.getOperand().getDefiningOp<LLVM::GEPOp>();
     if (!gep)
+      return failure();
+    if (!hasAffineCompatibleGEPIndexWidths(dataLayout, gep))
       return failure();
     Type currentType = gep.getElemType();
     if (currentType != ld.getType())
@@ -1243,6 +1263,10 @@ private:
     auto indices = SmallVector<LLVM::GEPIndicesAdaptor<ValueRange>::value_type>(
         indicesRange.begin(), indicesRange.end());
     assert(indices.size() > 0);
+
+    if (!hasAffineCompatibleGEPIndexWidths(dataLayout, gep))
+      return std::nullopt;
+
     Type currentType = gep.getElemType();
     auto expr = getExpr(indices[0]);
     if (failed(expr))
