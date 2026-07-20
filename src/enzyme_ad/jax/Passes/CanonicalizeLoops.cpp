@@ -347,6 +347,10 @@ LogicalResult AffineIntegerRangeAnalysis::visitOperation(
   return success();
 }
 
+void loadAffineIntegerRangeAnalysis(DataFlowSolver &solver) {
+  solver.load<AffineIntegerRangeAnalysis>();
+}
+
 } // namespace mlir::enzyme
 
 namespace {
