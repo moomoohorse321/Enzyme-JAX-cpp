@@ -828,6 +828,13 @@ struct AffineExprBuilder {
   SmallVector<Value> symbolOperands;
   SmallVector<Value> dimOperands;
   SmallVector<Operation *> indexMaterializations;
+  std::optional<uint64_t> affineIndexBitwidth;
+
+  // Record direct semantic mismatches (rounding, unsigned interpretation, or
+  // lossy casts) separately from an ordinary unsupported affine expression.
+  // The former rejects the enclosing access transaction; the latter may use
+  // the existing exact-pointer fallback.
+  bool hasUnprovenIntegerSemantics = false;
 
   // Options
   bool legalizeSymbols;
@@ -940,6 +947,41 @@ struct AffineExprBuilder {
     return getPosition(v, dimOperands, dimToPos);
   }
 
+  std::optional<uint64_t> getIntegerBitwidth(Type type) const {
+    if (auto integer = dyn_cast<IntegerType>(type))
+      return integer.getWidth();
+    if (type.isIndex())
+      return affineIndexBitwidth;
+    return std::nullopt;
+  }
+
+  bool fitsInAffineIndex(Type type) const {
+    auto width = getIntegerBitwidth(type);
+    return width && affineIndexBitwidth && *width <= *affineIndexBitwidth;
+  }
+
+  bool preservesAffineIntegerSemantics(Operation *op) {
+    if (auto div = dyn_cast<LLVM::SDivOp>(op))
+      return div.getIsExact();
+    if (auto div = dyn_cast<arith::DivSIOp>(op))
+      return div.getIsExact();
+    if (isa<LLVM::UDivOp, LLVM::SRemOp, LLVM::URemOp, LLVM::LShrOp,
+            arith::DivUIOp, arith::RemSIOp, arith::RemUIOp,
+            arith::ShRUIOp>(op))
+      return false;
+
+    if (auto ext = dyn_cast<LLVM::ZExtOp>(op))
+      return ext.getNonNeg();
+    if (auto ext = dyn_cast<arith::ExtUIOp>(op))
+      return ext.getNonNeg();
+    if (auto trunc = dyn_cast<LLVM::TruncOp>(op))
+      return trunc.hasNoSignedWrap();
+    if (auto trunc = dyn_cast<arith::TruncIOp>(op))
+      return trunc.hasNoSignedWrap();
+
+    return true;
+  }
+
   FailureOr<AffineExpr> buildExpr(Value v) {
     auto context = v.getContext();
     Operation *op = v.getDefiningOp();
@@ -964,6 +1006,14 @@ struct AffineExprBuilder {
       v = oldV;
     }
 
+    // An exact SSA value used as an affine symbol/dimension above preserves
+    // its defining operation. Only gate operations that would actually be
+    // replaced by an affine expression.
+    if (op && !preservesAffineIntegerSemantics(op)) {
+      hasUnprovenIntegerSemantics = true;
+      return failure();
+    }
+
     if (op) {
       if (op->getNumOperands() == 2 &&
           isa<LLVM::AddOp, arith::AddIOp, LLVM::SubOp, arith::SubIOp,
@@ -971,6 +1021,12 @@ struct AffineExprBuilder {
               arith::DivUIOp, arith::DivSIOp, LLVM::URemOp, arith::RemSIOp,
               LLVM::SRemOp, arith::RemUIOp, arith::ShRUIOp, arith::ShRSIOp,
               LLVM::LShrOp, LLVM::AShrOp, arith::OrIOp>(op)) {
+        if (isa<LLVM::SDivOp, arith::DivSIOp, LLVM::AShrOp,
+                arith::ShRSIOp>(op) &&
+            !fitsInAffineIndex(op->getOperand(0).getType())) {
+          hasUnprovenIntegerSemantics = true;
+          return failure();
+        }
         auto lhs = buildExpr(op->getOperand(0));
         if (failed(lhs))
           return failure();
@@ -985,20 +1041,30 @@ struct AffineExprBuilder {
         else if (isa<LLVM::MulOp, arith::MulIOp>(op))
           return (*lhs) * (*rhs);
         else if (isa<LLVM::UDivOp, LLVM::SDivOp, arith::DivUIOp,
-                     arith::DivSIOp>(op))
+                     arith::DivSIOp>(op)) {
+          auto divisor = dyn_cast<AffineConstantExpr>(*rhs);
+          if (!divisor || divisor.getValue() <= 0)
+            return failure();
           return (*lhs).floorDiv(*rhs);
-        else if (isa<arith::ShRUIOp, arith::ShRSIOp, LLVM::LShrOp,
+        } else if (isa<arith::ShRUIOp, arith::ShRSIOp, LLVM::LShrOp,
                      LLVM::AShrOp>(op)) {
           auto cexpr = dyn_cast<AffineConstantExpr>(*rhs);
           if (!cexpr)
             return failure();
+          auto sourceWidth =
+              getIntegerBitwidth(op->getOperand(0).getType());
+          int64_t shift = cexpr.getValue();
+          if (!sourceWidth || shift < 0 || shift >= *sourceWidth ||
+              shift >= 63)
+            return failure();
+          int64_t scale = int64_t{1} << shift;
           if (isa<arith::ShLIOp, LLVM::ShlOp>(op)) {
-            return (*lhs) * getAffineConstantExpr(1 << cexpr.getValue(),
-                                                  op->getContext());
+            return (*lhs) *
+                   getAffineConstantExpr(scale, op->getContext());
           } else if (isa<arith::ShRUIOp, arith::ShRSIOp, LLVM::LShrOp,
                          LLVM::AShrOp>(op)) {
             return (*lhs).floorDiv(
-                getAffineConstantExpr(1 << cexpr.getValue(), op->getContext()));
+                getAffineConstantExpr(scale, op->getContext()));
           } else {
             llvm_unreachable("unknown operation");
           }
@@ -1102,6 +1168,8 @@ public:
   PtrVal base = nullptr;
 
   LogicalResult build(const DataLayout &dataLayout, PtrVal addr) {
+    affineIndexBitwidth =
+        dataLayout.getTypeIndexBitwidth(IndexType::get(addr.getContext()));
     auto aa = buildAffineAccess(dataLayout, addr);
     if (failed(aa))
       return failure();
@@ -1774,6 +1842,10 @@ convertLLVMToAffineAccess(Operation *op,
     }
 
     AffineAccessBuilder &affine = *builder;
+    if (affine.hasUnprovenIntegerSemantics) {
+      unsupportedFunctions.insert(function);
+      continue;
+    }
     if (!accessBuilt[index] || !affine.isLegal())
       continue;
 
