@@ -1,4 +1,4 @@
-// RUN: enzymexlamlir-opt %s --canonicalize --split-input-file | FileCheck %s
+// RUN: enzymexlamlir-opt %s --llvm-to-affine-access --split-input-file | FileCheck %s
 
 // A byte value other than zero cannot be replaced by typed null values.
 // CHECK-LABEL: func.func @nonzero_memset(
@@ -71,14 +71,76 @@ func.func @zero_memset(%dst: memref<4xi32>) {
 
 // -----
 
-// Plain identity-layout memcpy follows the same conservative boundary in this
-// correctness PR; the dedicated raising PR will re-enable its proven subset.
+// A complete copy between identical static identity-layout memrefs has the
+// same elementwise semantics as memref.copy.
 // CHECK-LABEL: func.func @plain_memcpy(
 // CHECK-NOT:     scf.for
-// CHECK:         "llvm.intr.memcpy"({{.*}}) <{isVolatile = false}>
+// CHECK:         memref.copy %arg1, %arg0 : memref<4xi32> to memref<4xi32>
 func.func @plain_memcpy(%dst: memref<4xi32>, %src: memref<4xi32>) {
   %dst_ptr = "enzymexla.memref2pointer"(%dst) : (memref<4xi32>) -> !llvm.ptr
   %src_ptr = "enzymexla.memref2pointer"(%src) : (memref<4xi32>) -> !llvm.ptr
+  %size = arith.constant 16 : i64
+  "llvm.intr.memcpy"(%dst_ptr, %src_ptr, %size) <{isVolatile = false}> : (!llvm.ptr, !llvm.ptr, i64) -> ()
+  return
+}
+
+// -----
+
+// i24 has a three-byte store size, but this layout gives it eight-byte ABI
+// alignment. Neither copying the six value bytes nor all 16 allocation bytes
+// is equivalent to memref.copy: the latter does not copy observable padding.
+// CHECK-LABEL: func.func @custom_aligned_i24_full(
+// CHECK-NOT:     memref.copy
+// CHECK:         "llvm.intr.memcpy"({{.*}}) <{isVolatile = false}>
+// CHECK-LABEL: func.func @custom_aligned_i24_store_bytes_only(
+// CHECK-NOT:     memref.copy
+// CHECK:         "llvm.intr.memcpy"({{.*}}) <{isVolatile = false}>
+module attributes {
+  dlti.dl_spec = #dlti.dl_spec<i24 = dense<64> : vector<2xi64>>
+} {
+  func.func @custom_aligned_i24_full(%dst: memref<2xi24>,
+                                     %src: memref<2xi24>) {
+    %dst_ptr = "enzymexla.memref2pointer"(%dst) : (memref<2xi24>) -> !llvm.ptr
+    %src_ptr = "enzymexla.memref2pointer"(%src) : (memref<2xi24>) -> !llvm.ptr
+    %size = arith.constant 16 : i64
+    "llvm.intr.memcpy"(%dst_ptr, %src_ptr, %size) <{isVolatile = false}> : (!llvm.ptr, !llvm.ptr, i64) -> ()
+    return
+  }
+
+  func.func @custom_aligned_i24_store_bytes_only(%dst: memref<2xi24>,
+                                                  %src: memref<2xi24>) {
+    %dst_ptr = "enzymexla.memref2pointer"(%dst) : (memref<2xi24>) -> !llvm.ptr
+    %src_ptr = "enzymexla.memref2pointer"(%src) : (memref<2xi24>) -> !llvm.ptr
+    %size = arith.constant 6 : i64
+    "llvm.intr.memcpy"(%dst_ptr, %src_ptr, %size) <{isVolatile = false}> : (!llvm.ptr, !llvm.ptr, i64) -> ()
+    return
+  }
+}
+
+// -----
+
+// A partial byte copy cannot be replaced by a whole-buffer memref.copy.
+// CHECK-LABEL: func.func @partial_memcpy(
+// CHECK-NOT:     memref.copy
+// CHECK:         "llvm.intr.memcpy"({{.*}}) <{isVolatile = false}>
+func.func @partial_memcpy(%dst: memref<4xi32>, %src: memref<4xi32>) {
+  %dst_ptr = "enzymexla.memref2pointer"(%dst) : (memref<4xi32>) -> !llvm.ptr
+  %src_ptr = "enzymexla.memref2pointer"(%src) : (memref<4xi32>) -> !llvm.ptr
+  %size = arith.constant 8 : i64
+  "llvm.intr.memcpy"(%dst_ptr, %src_ptr, %size) <{isVolatile = false}> : (!llvm.ptr, !llvm.ptr, i64) -> ()
+  return
+}
+
+// -----
+
+// Equal byte counts do not make differently typed buffers interchangeable.
+// CHECK-LABEL: func.func @mismatched_memref_types(
+// CHECK-NOT:     memref.copy
+// CHECK:         "llvm.intr.memcpy"({{.*}}) <{isVolatile = false}>
+func.func @mismatched_memref_types(%dst: memref<4xi32>,
+                                   %src: memref<16xi8>) {
+  %dst_ptr = "enzymexla.memref2pointer"(%dst) : (memref<4xi32>) -> !llvm.ptr
+  %src_ptr = "enzymexla.memref2pointer"(%src) : (memref<16xi8>) -> !llvm.ptr
   %size = arith.constant 16 : i64
   "llvm.intr.memcpy"(%dst_ptr, %src_ptr, %size) <{isVolatile = false}> : (!llvm.ptr, !llvm.ptr, i64) -> ()
   return
