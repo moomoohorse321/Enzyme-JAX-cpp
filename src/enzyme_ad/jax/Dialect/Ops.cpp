@@ -989,10 +989,6 @@ OpFoldResult Pointer2MemrefOp::fold(FoldAdaptor adaptor) {
     getSourceMutable().assign(mc.getArg());
     return getResult();
   }
-  if (auto mc = getSource().getDefiningOp<LLVM::AddrSpaceCastOp>()) {
-    getSourceMutable().assign(mc.getArg());
-    return getResult();
-  }
   if (auto mc = getSource().getDefiningOp<LLVM::GEPOp>()) {
     for (auto idx : mc.getDynamicIndices()) {
       assert(idx);
