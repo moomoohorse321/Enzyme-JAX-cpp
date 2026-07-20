@@ -564,23 +564,6 @@ OpFoldResult Memref2PointerOp::fold(FoldAdaptor adaptor) {
   return nullptr;
 }
 
-/// Simplify cast(pointer2memref(x)) to pointer2memref(x)
-class Pointer2MemrefCast final : public OpRewritePattern<memref::CastOp> {
-public:
-  using OpRewritePattern<memref::CastOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(memref::CastOp op,
-                                PatternRewriter &rewriter) const override {
-    auto src = op.getSource().getDefiningOp<Pointer2MemrefOp>();
-    if (!src)
-      return failure();
-
-    rewriter.replaceOpWithNewOp<enzymexla::Pointer2MemrefOp>(op, op.getType(),
-                                                             src.getSource());
-    return success();
-  }
-};
-
 /// Simplify memref2pointer(pointer2memref(x)) to cast(x)
 class Pointer2Memref2PointerCast final
     : public OpRewritePattern<Memref2PointerOp> {
@@ -967,7 +950,7 @@ void MetaPointer2Memref<affine::AffineStoreOp>::rewriteInternal(
 
 void Pointer2MemrefOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                                    MLIRContext *context) {
-  results.insert<Pointer2MemrefCast, Pointer2Memref2PointerCast,
+  results.insert<Pointer2Memref2PointerCast,
                  LoadStorePointer2MemrefGEP<memref::LoadOp>,
                  LoadStorePointer2MemrefGEP<affine::AffineLoadOp>,
                  LoadStorePointer2MemrefGEP<memref::StoreOp>,
