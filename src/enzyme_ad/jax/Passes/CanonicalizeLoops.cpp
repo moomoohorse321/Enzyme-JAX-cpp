@@ -1334,8 +1334,6 @@ struct CanonicalizeLoopsPass
 
 void mlir::enzyme::addSingleIter(RewritePatternSet &patterns,
                                  MLIRContext *ctx) {
-  patterns
-      .add<RemoveAffineParallelSingleIter, ExtUIOfIndexUI, TruncIOfIndexUI,
-           ShrUIOfIndexUI, DivUIOfIndexUI, DivMul, AddIOfIndexUI, SubIOfIndexUI,
-           MulIOfIndexUI, ShLIOfIndexUI, AddIOfDoubleIndex, ToRem>(ctx);
+  // Cast motion requires target index-width and fixed-width no-wrap proofs.
+  patterns.add<RemoveAffineParallelSingleIter, ToRem>(ctx);
 }
