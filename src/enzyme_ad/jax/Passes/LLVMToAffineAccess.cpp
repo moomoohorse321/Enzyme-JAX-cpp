@@ -681,7 +681,7 @@ struct SelectCSE : public OpRewritePattern<arith::SelectOp> {
                                 lhs->getOperand(0), rhs->getOperand(0));
     auto op1 =
         arith::SelectOp::create(rewriter, rhs->getLoc(), sel.getCondition(),
-                                rhs->getOperand(1), rhs->getOperand(1));
+                                lhs->getOperand(1), rhs->getOperand(1));
     if (isa<arith::AddIOp>(lhs)) {
       rewriter.replaceOpWithNewOp<arith::AddIOp>(sel, op0, op1);
     } else {
