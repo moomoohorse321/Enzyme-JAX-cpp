@@ -31,9 +31,8 @@ func.func @constant_load_idx(%idx: i64) -> f64 {
 // CHECK-LABEL: func @dynamic_load_idx(
 // CHECK-SAME:    %[[IDX1:.*]]: i64
 // CHECK-SAME:    %[[IDX2:.*]]: i32
-// CHECK-SAME:    %[[IDX3:.*]]: i8
 // CHECK-SAME:    %[[LOAD_IDX:.*]]: index
-func.func @dynamic_load_idx(%idx1: i64, %idx2: i32, %idx3: i8, %load_idx: index) -> f16 {
+func.func @dynamic_load_idx(%idx1: i64, %idx2: i32, %load_idx: index) -> f16 {
   // CHECK: %[[C2:.*]] = arith.constant 2
   %c16 = llvm.mlir.constant(16: i32) : i32
 
@@ -43,24 +42,39 @@ func.func @dynamic_load_idx(%idx1: i64, %idx2: i32, %idx3: i8, %load_idx: index)
   // CHECK-NOT: llvm.getelementptr
   %ptr_f32 = llvm.getelementptr %ptr[%idx1] : (!llvm.ptr, i64) -> !llvm.ptr, f32
   %ptr_i16 = llvm.getelementptr %ptr_f32[%idx2] : (!llvm.ptr, i32) -> !llvm.ptr, i16
-  %ptr_i8 = llvm.getelementptr inbounds %ptr_i16[%idx3] : (!llvm.ptr, i8) -> !llvm.ptr, i8
 
   // CHECK: %[[MEMREF:.*]] = "enzymexla.pointer2memref"(%[[BASE]])
-  %memref = "enzymexla.pointer2memref"(%ptr_i8) : (!llvm.ptr) -> memref<?xf16>
+  %memref = "enzymexla.pointer2memref"(%ptr_i16) : (!llvm.ptr) -> memref<?xf16>
 
   // CHECK: %[[IDX_CAST1:.*]] = arith.index_cast %[[IDX1]]
   // CHECK: %[[SCALED1:.*]] = arith.muli %[[IDX_CAST1]], %[[C2]] : index
 
   // CHECK: %[[IDX_CAST2:.*]] = arith.index_cast %[[IDX2]]
-  // CHECK: %[[OFFSET2:.*]] = arith.addi %[[SCALED1]], %[[IDX_CAST2]] : index
+  // CHECK: %[[OFFSET:.*]] = arith.addi %[[SCALED1]], %[[IDX_CAST2]] : index
 
-  // CHECK: %[[IDX_CAST3:.*]] = arith.index_cast %[[IDX3]]
-  // CHECK: %[[SCALED3:.*]] = arith.divsi %[[IDX_CAST3]], %[[C2]] : index
-  // CHECK: %[[OFFSET3:.*]] = arith.addi %[[OFFSET2]], %[[SCALED3]] : index
-  
-  // CHECK: %[[EIDX:.*]] = arith.addi %[[LOAD_IDX]], %[[OFFSET3]] : index
+  // CHECK: %[[EIDX:.*]] = arith.addi %[[LOAD_IDX]], %[[OFFSET]] : index
 
   // CHECK: memref.load %[[MEMREF]][%[[EIDX]]] : memref<?xf16>
+  %val = memref.load %memref[%load_idx] : memref<?xf16>
+
+  func.return %val : f16
+}
+
+// -----
+
+// CHECK-LABEL: func @reject_unaligned_dynamic_gep(
+// CHECK-SAME:    %[[PTR:.*]]: !llvm.ptr
+// CHECK-SAME:    %[[BYTE_OFFSET:.*]]: i8
+// CHECK-SAME:    %[[LOAD_IDX:.*]]: index
+func.func @reject_unaligned_dynamic_gep(%ptr: !llvm.ptr, %byte_offset: i8, %load_idx: index) -> f16 {
+  // CHECK: %[[GEP:.*]] = llvm.getelementptr %[[PTR]][%[[BYTE_OFFSET]]]
+  %ptr_i8 = llvm.getelementptr %ptr[%byte_offset] : (!llvm.ptr, i8) -> !llvm.ptr, i8
+
+  // CHECK: %[[MEMREF:.*]] = "enzymexla.pointer2memref"(%[[GEP]])
+  %memref = "enzymexla.pointer2memref"(%ptr_i8) : (!llvm.ptr) -> memref<?xf16>
+
+  // CHECK-NOT: arith.divsi
+  // CHECK: memref.load %[[MEMREF]][%[[LOAD_IDX]]] : memref<?xf16>
   %val = memref.load %memref[%load_idx] : memref<?xf16>
 
   func.return %val : f16
