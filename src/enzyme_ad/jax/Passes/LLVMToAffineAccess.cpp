@@ -272,8 +272,10 @@ convertLLVMAllocaToMemrefAlloca(FromAlloc alloc, RewriterBase &rewriter,
     if (elNum == ShapedType::kDynamic) {
       auto sizeVal = getConstant(alloc.getDynamicSizes()[0]);
       if (!sizeVal) {
-        size_t num = 1;
-        size_t den = 1;
+        // Track only a known power-of-two factor of the dynamic extent. It is
+        // used below solely to prove byte-size divisibility for the new view.
+        uint64_t num = 1;
+        uint64_t den = 1;
         Value op = alloc.getDynamicSizes()[0];
         while (true) {
           if (auto icast = op.getDefiningOp<arith::IndexCastOp>()) {
@@ -286,13 +288,18 @@ convertLLVMAllocaToMemrefAlloca(FromAlloc alloc, RewriterBase &rewriter,
           }
           if (auto shr = op.getDefiningOp<arith::ShRSIOp>()) {
             if (auto cst = getConstant(shr.getRhs())) {
-              auto val = 1ULL << *cst;
+              if (*cst < 0 || *cst >= 64)
+                return failure();
+              uint64_t val = uint64_t{1} << static_cast<unsigned>(*cst);
               if (num % val == 0) {
                 num /= val;
                 op = shr.getLhs();
                 continue;
-              } else if (val != 0 && val % num == 0) {
-                den *= (val / num);
+              } else if (val % num == 0) {
+                auto newDen = llvm::checkedMulUnsigned(den, val / num);
+                if (!newDen)
+                  return failure();
+                den = *newDen;
                 num = 1;
                 op = shr.getLhs();
                 continue;
@@ -301,13 +308,18 @@ convertLLVMAllocaToMemrefAlloca(FromAlloc alloc, RewriterBase &rewriter,
           }
           if (auto shr = op.getDefiningOp<arith::ShRUIOp>()) {
             if (auto cst = getConstant(shr.getRhs())) {
-              auto val = 1ULL << *cst;
+              if (*cst < 0 || *cst >= 64)
+                return failure();
+              uint64_t val = uint64_t{1} << static_cast<unsigned>(*cst);
               if (num % val == 0) {
                 num /= val;
                 op = shr.getLhs();
                 continue;
-              } else if (val != 0 && val % num == 0) {
-                den *= (val / num);
+              } else if (val % num == 0) {
+                auto newDen = llvm::checkedMulUnsigned(den, val / num);
+                if (!newDen)
+                  return failure();
+                den = *newDen;
                 num = 1;
                 op = shr.getLhs();
                 continue;
@@ -316,13 +328,18 @@ convertLLVMAllocaToMemrefAlloca(FromAlloc alloc, RewriterBase &rewriter,
           }
           if (auto shl = op.getDefiningOp<arith::ShLIOp>()) {
             if (auto cst = getConstant(shl.getRhs())) {
-              auto val = 1ULL << *cst;
+              if (*cst < 0 || *cst >= 64)
+                return failure();
+              uint64_t val = uint64_t{1} << static_cast<unsigned>(*cst);
               if (den % val == 0) {
                 den /= val;
                 op = shl.getLhs();
                 continue;
-              } else if (val != 0 && val % den == 0) {
-                num *= (val / den);
+              } else if (val % den == 0) {
+                auto newNum = llvm::checkedMulUnsigned(num, val / den);
+                if (!newNum)
+                  return failure();
+                num = *newNum;
                 den = 1;
                 op = shl.getLhs();
                 continue;
@@ -335,7 +352,9 @@ convertLLVMAllocaToMemrefAlloca(FromAlloc alloc, RewriterBase &rewriter,
           break;
         }
         if (den == 1) {
-          elNum = num;
+          if (num > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+            return failure();
+          elNum = static_cast<int64_t>(num);
         } else {
           return failure();
         }
@@ -343,11 +362,18 @@ convertLLVMAllocaToMemrefAlloca(FromAlloc alloc, RewriterBase &rewriter,
         elNum = *sizeVal;
       }
     }
-    elNum *= dataLayout.getTypeSize(
-        cast<MemRefType>(alloc->getResult(0).getType()).getElementType());
     if (elNum < 0)
       return failure();
-    allocationSize = static_cast<uint64_t>(elNum);
+
+    auto oldElSize = dataLayout.getTypeSize(
+        cast<MemRefType>(alloc->getResult(0).getType()).getElementType());
+    if (oldElSize.isScalable())
+      return failure();
+    auto checkedAllocationSize = llvm::checkedMulUnsigned(
+        static_cast<uint64_t>(elNum), oldElSize.getFixedValue());
+    if (!checkedAllocationSize)
+      return failure();
+    allocationSize = *checkedAllocationSize;
   }
 
   uint64_t newElSize;
