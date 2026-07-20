@@ -170,6 +170,45 @@ convertLLVMAllocaToMemrefAlloca(FromAlloc alloc, RewriterBase &rewriter,
   }
 
   auto ptr2memref = p2ms[0];
+  if constexpr (!inPlace) {
+    if (!getConstant(alloc.getArraySize())) {
+      auto memrefType = ptr2memref.getType();
+      auto pointerType = cast<LLVM::LLVMPointerType>(alloc.getType());
+      if (memrefType.getRank() != 1 || !memrefType.isDynamicDim(0) ||
+          !memrefType.getLayout().isIdentity() ||
+          memrefType.getElementType() != alloc.getElemType() ||
+          memrefType.getMemorySpaceAsInt() != pointerType.getAddressSpace())
+        return rewriter.notifyMatchFailure(
+            alloc, "dynamic alloca requires an exact rank-one memref view");
+      if (llvm::any_of(p2ms, [&](enzymexla::Pointer2MemrefOp p2m) {
+            return p2m.getType() != memrefType;
+          }))
+        return rewriter.notifyMatchFailure(
+            alloc, "dynamic alloca views must have identical types");
+      if (alloc.getInalloca())
+        return rewriter.notifyMatchFailure(alloc,
+                                           "cannot preserve inalloca semantics");
+      auto alignment = alloc.getAlignmentAttr();
+      if (alignment && (!alignment.getValue().isStrictlyPositive() ||
+                        !alignment.getValue().isPowerOf2()))
+        return rewriter.notifyMatchFailure(alloc,
+                                           "invalid alloca alignment");
+
+      Value dynamicExtent = arith::IndexCastUIOp::create(
+          rewriter, alloc->getLoc(), rewriter.getIndexType(),
+          alloc.getArraySize());
+      Value newAlloc = memref::AllocaOp::create(
+          rewriter, alloc->getLoc(), memrefType, ValueRange{dynamicExtent},
+          alignment);
+      for (auto p2m : p2ms)
+        rewriter.replaceOp(p2m, newAlloc);
+      for (auto other : others)
+        rewriter.eraseOp(other);
+      rewriter.eraseOp(alloc);
+      return success();
+    }
+  }
+
   int64_t elNum;
   if constexpr (!inPlace) {
     auto sizeVal = getConstant(alloc.getArraySize());
