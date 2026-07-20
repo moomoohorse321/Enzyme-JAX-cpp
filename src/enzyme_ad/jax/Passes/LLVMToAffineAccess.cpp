@@ -140,6 +140,19 @@ convertLLVMAllocaToMemrefAlloca(FromAlloc alloc, RewriterBase &rewriter,
   }
   if (p2ms.size() == 0)
     return failure();
+
+  unsigned allocationSpace;
+  if constexpr (!inPlace)
+    allocationSpace =
+        cast<LLVM::LLVMPointerType>(alloc.getType()).getAddressSpace();
+  else
+    allocationSpace = cast<MemRefType>(alloc.getType()).getMemorySpaceAsInt();
+  for (auto p2m : p2ms) {
+    if (p2m.getType().getMemorySpaceAsInt() != allocationSpace)
+      return rewriter.notifyMatchFailure(alloc,
+                                         "allocation address space mismatch");
+  }
+
   for (int i = 1; i < p2ms.size(); i++) {
     if (p2ms[i].getType().getElementType() !=
         p2ms[0].getType().getElementType()) {
