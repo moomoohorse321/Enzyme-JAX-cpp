@@ -296,9 +296,20 @@ convertLLVMAllocaToMemrefAlloca(FromAlloc alloc, RewriterBase &rewriter,
                   ptr2memref.getResult().getType().getElementType())));
     }
 
+    NamedAttrList attrs(alloc->getAttrs());
+    if (isa<memref::AllocOp, memref::AllocaOp>(alloc.getOperation()) &&
+        !attrs.get("alignment")) {
+      uint64_t oldAlignment = dataLayout.getTypeABIAlignment(
+          alloc.getType().getElementType());
+      uint64_t newAlignment =
+          dataLayout.getTypeABIAlignment(memrefType.getElementType());
+      if (oldAlignment > newAlignment)
+        attrs.set("alignment", rewriter.getI64IntegerAttr(oldAlignment));
+    }
+
     auto newOp = cast<FromAlloc>(rewriter.create(
         alloc->getLoc(), alloc->getName().getIdentifier(), alloc->getOperands(),
-        tys, alloc->getAttrs(), alloc->getSuccessors()));
+        tys, attrs.getAttrs(), alloc->getSuccessors()));
 
     if (alloc.getDynamicSizes().size()) {
       newOp.getDynamicSizesMutable().assign(dyn);
