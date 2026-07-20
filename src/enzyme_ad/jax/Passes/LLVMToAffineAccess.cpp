@@ -735,43 +735,6 @@ struct Pointer2MemrefSelect
   }
 };
 
-struct LoadSelect : public OpRewritePattern<affine::AffineLoadOp> {
-  using OpRewritePattern::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(affine::AffineLoadOp ld,
-                                PatternRewriter &rewriter) const override {
-    auto sel = ld.getMemRef().getDefiningOp<arith::SelectOp>();
-    if (!sel)
-      return failure();
-
-    SmallVector<Type> resultTypes = {ld.getType()};
-
-    auto newIfOp = scf::IfOp::create(rewriter, sel.getLoc(), resultTypes,
-                                     sel.getCondition(),
-                                     /*hasElse=*/true);
-
-    // Create new yield in then block
-    {
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPointToEnd(newIfOp.thenBlock());
-      auto ld2 = cast<affine::AffineLoadOp>(rewriter.clone(*ld));
-      ld2.getMemrefMutable().set(sel.getTrueValue());
-      scf::YieldOp::create(rewriter, sel.getLoc(), ld2->getResults());
-    }
-
-    // Create new yield in else block
-    {
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPointToEnd(newIfOp.elseBlock());
-      auto ld2 = cast<affine::AffineLoadOp>(rewriter.clone(*ld));
-      ld2.getMemrefMutable().set(sel.getFalseValue());
-      scf::YieldOp::create(rewriter, sel.getLoc(), ld2->getResults());
-    }
-    rewriter.replaceOp(ld, newIfOp);
-    return success();
-  }
-};
-
 } // namespace
 
 static MemRefVal convertToMemref(PtrVal addr) {
