@@ -590,6 +590,28 @@ struct MemrefLoadAffineApply : public OpRewritePattern<memref::LoadOp> {
 
     while (todo.size()) {
       auto cur = todo.pop_back_val();
+      // isValidIndex recursively accepts add/sub, but affine.apply uses
+      // mathematical integer arithmetic rather than modular index arithmetic.
+      // Inspect these operations first and only decompose them with an nsw
+      // proof; otherwise retain the exact SSA value as an irreducible term.
+      if (auto add = cur.second.getDefiningOp<arith::AddIOp>()) {
+        if (!add.hasNoSignedWrap()) {
+          irreducible.push_back(cur);
+          continue;
+        }
+        todo.emplace_back(cur.first, add.getLhs());
+        todo.emplace_back(cur.first, add.getRhs());
+        continue;
+      }
+      if (auto sub = cur.second.getDefiningOp<arith::SubIOp>()) {
+        if (!sub.hasNoSignedWrap()) {
+          irreducible.push_back(cur);
+          continue;
+        }
+        todo.emplace_back(cur.first, sub.getLhs());
+        todo.emplace_back(!cur.first, sub.getRhs());
+        continue;
+      }
       if (isValidIndex(cur.second, scope)) {
         auto d2 = rewriter.getAffineSymbolExpr(operands.size());
         operands.push_back(cur.second);
@@ -597,16 +619,6 @@ struct MemrefLoadAffineApply : public OpRewritePattern<memref::LoadOp> {
           expr = expr - d2;
         else
           expr = expr + d2;
-        continue;
-      }
-      if (auto add = cur.second.getDefiningOp<arith::AddIOp>()) {
-        todo.emplace_back(cur.first, add.getLhs());
-        todo.emplace_back(cur.first, add.getRhs());
-        continue;
-      }
-      if (auto add = cur.second.getDefiningOp<arith::SubIOp>()) {
-        todo.emplace_back(cur.first, add.getLhs());
-        todo.emplace_back(!cur.first, add.getRhs());
         continue;
       }
       irreducible.push_back(cur);
