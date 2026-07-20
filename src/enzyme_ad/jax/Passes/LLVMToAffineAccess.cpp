@@ -284,6 +284,15 @@ convertLLVMAllocaToMemrefAlloca(FromAlloc alloc, RewriterBase &rewriter,
         sizes, ptr2memref.getResult().getType().getElementType(),
         MemRefLayoutAttrInterface{}, alloc.getType().getMemorySpace());
   }
+
+  for (auto p2m : p2ms) {
+    if (memrefType.getElementType() != p2m.getType().getElementType())
+      continue;
+    if (!memref::CastOp::areCastCompatible(memrefType, p2m.getType()))
+      return rewriter.notifyMatchFailure(
+          alloc, "allocation type is incompatible with pointer view");
+  }
+
   Value newAlloc;
   if constexpr (!inPlace)
     newAlloc = memref::AllocaOp::create(rewriter, alloc->getLoc(), memrefType);
