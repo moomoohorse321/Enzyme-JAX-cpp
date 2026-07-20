@@ -1,9 +1,11 @@
 // RUN: enzymexlamlir-opt %s --llvm-to-affine-access --split-input-file | FileCheck %s
 
-// A byte value other than zero cannot be replaced by typed null values.
+// A complete constant-byte fill of an integer memref is the corresponding
+// repeated-byte integer value.
 // CHECK-LABEL: func.func @nonzero_memset(
-// CHECK-NOT:     scf.for
-// CHECK:         "llvm.intr.memset"({{.*}}) <{isVolatile = false}>
+// CHECK:         %[[FILL:.*]] = arith.constant 707406378 : i32
+// CHECK:         linalg.fill ins(%[[FILL]] : i32) outs(%arg0 : memref<4xi32>)
+// CHECK-NOT:     "llvm.intr.memset"
 func.func @nonzero_memset(%dst: memref<4xi32>) {
   %ptr = "enzymexla.memref2pointer"(%dst) : (memref<4xi32>) -> !llvm.ptr
   %value = arith.constant 42 : i8

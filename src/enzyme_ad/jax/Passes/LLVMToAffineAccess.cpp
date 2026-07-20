@@ -1806,7 +1806,7 @@ public:
   }
 };
 
-class StaticIdentityZeroMemsetSimplification final
+class StaticIdentityIntegerMemsetSimplification final
     : public OpRewritePattern<LLVM::MemsetOp> {
 public:
   using OpRewritePattern<LLVM::MemsetOp>::OpRewritePattern;
@@ -1825,8 +1825,7 @@ public:
       return failure();
 
     IntegerAttr byteValue;
-    if (!matchPattern(op.getVal(), m_Constant(&byteValue)) ||
-        !byteValue.getValue().isZero())
+    if (!matchPattern(op.getVal(), m_Constant(&byteValue)))
       return failure();
 
     std::optional<uint64_t> totalBytes =
@@ -1836,9 +1835,12 @@ public:
 
     Location loc = op.getLoc();
     auto elementTy = cast<IntegerType>(dstTy.getElementType());
-    Value zero = arith::ConstantOp::create(
-        rewriter, loc, elementTy, rewriter.getIntegerAttr(elementTy, 0));
-    linalg::FillOp::create(rewriter, loc, zero, dst.getSource());
+    APInt elementValue = APInt::getSplat(
+        elementTy.getWidth(), byteValue.getValue().zextOrTrunc(8));
+    Value fill = arith::ConstantOp::create(
+        rewriter, loc, elementTy,
+        rewriter.getIntegerAttr(elementTy, elementValue));
+    linalg::FillOp::create(rewriter, loc, fill, dst.getSource());
     rewriter.eraseOp(op);
     return success();
   }
@@ -2076,7 +2078,7 @@ convertLLVMToAffineAccess(Operation *op,
     patterns.insert<IndexCastAddSub, MemrefLoadAffineApply, SelectCSE,
                     SelectAddrCast>(context);
     patterns.insert<StaticIdentityMemcpySimplification,
-                    StaticIdentityZeroMemsetSimplification>(context);
+                    StaticIdentityIntegerMemsetSimplification>(context);
     patterns.insert<SimplifyAllocConst<memref::AllocOp>,
                     SimplifyAllocConst<memref::AllocaOp>,
                     SimplifyAllocConst<gpu::AllocOp, true>>(context);
