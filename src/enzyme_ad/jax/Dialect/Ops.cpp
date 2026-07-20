@@ -623,6 +623,9 @@ public:
     if (!src)
       return failure();
 
+    if (src.getSource().getType() != op.getType())
+      return failure();
+
     rewriter.replaceOpWithNewOp<LLVM::BitcastOp>(op, op.getType(),
                                                  src.getSource());
     return success();
