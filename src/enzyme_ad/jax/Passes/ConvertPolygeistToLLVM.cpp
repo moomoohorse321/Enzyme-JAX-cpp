@@ -273,17 +273,9 @@ struct Memref2PointerOpLowering
       return success();
     }
 
-    // MemRefDescriptor sourceMemRef(operands.front());
-    MemRefDescriptor targetMemRef(
-        transformed.getSource()); // MemRefDescriptor::undef(rewriter, loc,
-                                  // targetDescTy);
-
-    // Offset.
-    Value baseOffset = targetMemRef.offset(rewriter, loc);
-    Value ptr = targetMemRef.alignedPtr(rewriter, loc);
-    Value idxs[] = {baseOffset};
-    ptr = LLVM::GEPOp::create(rewriter, loc, ptr.getType(),
-                              rewriter.getI8Type(), ptr, idxs);
+    auto sourceType = cast<MemRefType>(op.getSource().getType());
+    Value ptr = getStridedElementPtr(rewriter, loc, sourceType,
+                                     transformed.getSource(), /*indices=*/{});
     if (space0 != LPT.getAddressSpace())
       ptr = LLVM::AddrSpaceCastOp::create(rewriter, loc, LPT, ptr);
 
