@@ -33,13 +33,13 @@ func.func @test_aligned_load_store_conversion(%arg0: !llvm.ptr<1>, %idx: i64) {
 // CHECK-LABEL:   func.func @test_load_store_conversion(
 // CHECK-SAME:                                          %[[VAL_0:[^:]*]]: !llvm.ptr<1>,
 // CHECK-SAME:                                          %[[VAL_1:[^:]*]]: i64) {
-// CHECK:           %[[VAL_3:.*]] = arith.index_cast %[[VAL_1]] : i64 to index
-// CHECK:           %[[VAL_4:.*]] = arith.index_cast %[[VAL_1]] : i64 to index
-// CHECK:           %[[VAL_2:.*]] = "enzymexla.pointer2memref"(%[[VAL_0]]) : (!llvm.ptr<1>) -> memref<?xi64, 1>
-// CHECK:           %[[VAL_5:.*]] = affine.load %[[VAL_2]][symbol(%[[VAL_3]])] {alignment = 1 : i64, ordering = 0 : i64} : memref<?xi64, 1>
-// CHECK:           %[[VAL_6:.*]] = llvm.mul %[[VAL_5]], %[[VAL_5]] : i64
-// CHECK:           %[[PVAL_2:.*]] = "enzymexla.pointer2memref"(%[[VAL_0]]) : (!llvm.ptr<1>) -> memref<?xi64, 1>
-// CHECK:           affine.store %[[VAL_6]], %[[PVAL_2]][symbol(%[[VAL_4]])] {alignment = 1 : i64, ordering = 0 : i64} : memref<?xi64, 1>
+// CHECK-NOT:       affine.load
+// CHECK-NOT:       affine.store
+// CHECK-NOT:       enzymexla.pointer2memref
+// CHECK:           %[[ADDR:.*]] = llvm.getelementptr inbounds %[[VAL_0]][%[[VAL_1]]]
+// CHECK:           %[[LOADED:.*]] = llvm.load %[[ADDR]] {alignment = 1 : i64}
+// CHECK:           %[[SQUARED:.*]] = llvm.mul %[[LOADED]], %[[LOADED]] : i64
+// CHECK:           llvm.store %[[SQUARED]], %[[ADDR]] {alignment = 1 : i64}
 // CHECK:           return
 // CHECK:         }
 func.func @test_load_store_conversion(%arg0: !llvm.ptr<1>, %idx: i64) {

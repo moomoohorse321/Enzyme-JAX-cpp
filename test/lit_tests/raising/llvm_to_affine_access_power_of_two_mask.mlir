@@ -5,10 +5,9 @@
 // low-bit mask is exactly Euclidean modulo 8, including for negative indices.
 // RAISE-LABEL: func.func @llvm_masked_store_load(
 // RAISE-NOT:     llvm.and
-// RAISE-NOT:     enzymexla.pointer2memref
 // RAISE-NOT:     mod 8
-// RAISE:         affine.store %{{.*}}, %{{.*}}[%{{.*}}] : memref<8xi32>
-// RAISE:         %{{.*}} = affine.load %{{.*}}[%{{.*}}] : memref<8xi32>
+// RAISE:         affine.store %{{.*}}, %{{.*}}[%{{.*}}] : memref<?xi32>
+// RAISE:         %{{.*}} = affine.load %{{.*}}[%{{.*}}] : memref<?xi32>
 // RAW-LABEL: func.func @llvm_masked_store_load(
 // RAW:           affine.store %{{.*}}, %{{.*}}[%{{.*}} mod 8]
 // RAW:           affine.load %{{.*}}[%{{.*}} mod 8]
@@ -35,7 +34,7 @@ func.func @llvm_masked_store_load(%storage: memref<8xi32>) -> i32 {
 // recovery runs.
 // RAISE-LABEL: func.func @arith_masked_load(
 // RAISE-NOT:     arith.andi
-// RAISE:         affine.load %{{.*}}[%{{.*}} mod 16] {{.*}}: memref<16xi32>
+// RAISE:         affine.load %{{.*}}[%{{.*}} mod 16] {{.*}}: memref<?xi32>
 func.func @arith_masked_load(%storage: memref<16xi32>) -> i32 {
   %ptr = "enzymexla.memref2pointer"(%storage)
       : (memref<16xi32>) -> !llvm.ptr

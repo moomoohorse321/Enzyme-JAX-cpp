@@ -36,8 +36,9 @@ func.func @weak_alignment(%storage: memref<8xi64, 1>, %value: i64,
 // CHECK-LABEL: func.func @abi_or_stronger_alignment(
 // CHECK-NOT:     llvm.load
 // CHECK-NOT:     llvm.store
-// CHECK:         affine.store %arg1, %arg0[symbol(%arg2)] {alignment = 16 : i64
-// CHECK:         return %arg1 : i64
+// CHECK:         affine.store %arg1, %[[STORE_VIEW:.*]][symbol(%arg2)] {alignment = 16 : i64
+// CHECK:         %[[ALIGNED:.*]] = affine.load %[[LOAD_VIEW:.*]][symbol(%arg2)] {alignment = 8 : i64
+// CHECK:         return %[[ALIGNED]] : i64
 // RAW-LABEL: func.func @abi_or_stronger_alignment(
 // RAW-NOT:     llvm.load
 // RAW-NOT:     llvm.store

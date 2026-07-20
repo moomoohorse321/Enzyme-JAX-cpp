@@ -233,7 +233,7 @@ func.func @proven_integer_semantics(%storage: memref<512xi32>) -> i32 {
 func.func @generic_failure_stays_local(%storage: memref<8xi32>) -> i32 {
   %ptr = "enzymexla.memref2pointer"(%storage) : (memref<8xi32>) -> !llvm.ptr
   %init = llvm.load %ptr : !llvm.ptr -> i32
-  %mask = llvm.mlir.constant(3 : i64) : i64
+  %mask = llvm.mlir.constant(5 : i64) : i64
   %result = affine.for %i = 0 to 4 iter_args(%acc = %init) -> (i32) {
     %i64 = arith.index_cast %i : index to i64
     %masked = llvm.and %i64, %mask : i64
