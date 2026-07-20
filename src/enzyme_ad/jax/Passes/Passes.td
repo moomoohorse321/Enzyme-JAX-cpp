@@ -842,8 +842,10 @@ def LLVMToAffineAccessPass : Pass<"llvm-to-affine-access"> {
   let summary = "";
   let dependentDialects = [
     "LLVM::LLVMDialect",
+    "arith::ArithDialect",
     "memref::MemRefDialect",
     "affine::AffineDialect",
+    "linalg::LinalgDialect",
     "vector::VectorDialect",
     "enzymexla::EnzymeXLADialect",
     "vector::VectorDialect",
