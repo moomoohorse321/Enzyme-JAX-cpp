@@ -272,9 +272,14 @@ convertLLVMAllocaToMemrefAlloca(FromAlloc alloc, RewriterBase &rewriter,
         MemRefLayoutAttrInterface{}, alloc.getType().getMemorySpace());
   }
   Value newAlloc;
-  if constexpr (!inPlace)
-    newAlloc = memref::AllocaOp::create(rewriter, alloc->getLoc(), memrefType);
-  else {
+  if constexpr (!inPlace) {
+    auto alignment = alloc.getAlignmentAttr();
+    if (alignment && (!alignment.getValue().isStrictlyPositive() ||
+                      !alignment.getValue().isPowerOf2()))
+      return rewriter.notifyMatchFailure(alloc, "invalid alloca alignment");
+    newAlloc = memref::AllocaOp::create(rewriter, alloc->getLoc(), memrefType,
+                                        alignment);
+  } else {
 
     auto tys = llvm::to_vector(alloc->getResultTypes());
     tys[0] = memrefType;
