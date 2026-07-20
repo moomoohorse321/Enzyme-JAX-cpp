@@ -711,13 +711,14 @@ public:
       if (!idx)
         idx = arith::ConstantIndexOp::create(
             rewriter, loc, cast<IntegerAttr>(rawIdx).getValue().getSExtValue());
-      // TODO: verify the total byte offset will be element-aligned for dynamic
-      // indices by inserting runtime check
       if (auto constIdx = idx.getDefiningOp<arith::ConstantIndexOp>()) {
         // For constant indices, static check and reject unaligned access
         if ((constIdx.value() * gepElemSize) % elementSize != 0) {
           return failure();
         }
+      } else if (gepElemSize % elementSize != 0) {
+        // Do not truncate a possibly unaligned dynamic byte offset.
+        return failure();
       }
 
       // Convert index to the right type if needed
