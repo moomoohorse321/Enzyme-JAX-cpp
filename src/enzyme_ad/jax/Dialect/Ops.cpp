@@ -246,36 +246,6 @@ void JITCallOp::getCanonicalizationPatterns(RewritePatternSet &results,
   results.insert<ReadOnlyArg<JITCallOp>, ReadNoneArg<JITCallOp>>(context);
 }
 
-/// Simplify pointer2memref(memref2pointer(x)) to cast(x)
-class Memref2Pointer2MemrefCast final
-    : public OpRewritePattern<Pointer2MemrefOp> {
-public:
-  using OpRewritePattern<Pointer2MemrefOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(Pointer2MemrefOp op,
-                                PatternRewriter &rewriter) const override {
-    auto src = op.getSource().getDefiningOp<Memref2PointerOp>();
-    if (!src)
-      return failure();
-    auto smt = cast<MemRefType>(src.getSource().getType());
-    auto omt = cast<MemRefType>(op.getType());
-    if (smt.getShape().size() != omt.getShape().size())
-      return failure();
-    for (unsigned i = 1; i < smt.getShape().size(); i++) {
-      if (smt.getShape()[i] != omt.getShape()[i])
-        return failure();
-    }
-    if (smt.getElementType() != omt.getElementType())
-      return failure();
-    if (smt.getMemorySpace() != omt.getMemorySpace())
-      return failure();
-
-    rewriter.replaceOpWithNewOp<memref::CastOp>(op, op.getType(),
-                                                src.getSource());
-    return success();
-  }
-};
-
 #if 0
 /// Simplify pointer2memref(memref2pointer(x)) to cast(x)
 class Memref2PointerIndex final : public OpRewritePattern<Memref2PointerOp> {
@@ -562,9 +532,9 @@ public:
 void Memref2PointerOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                                    MLIRContext *context) {
   results.insert<
-      // Memref2Pointer2MemrefCast, Memref2PointerIndex,
+      // Memref2PointerIndex,
       // Memref2PointerBitCast,
-      Memref2Pointer2MemrefCast, Memref2PointerBitCast,
+      Memref2PointerBitCast,
 
       SetSimplification<LLVM::MemsetOp>, CopySimplification<LLVM::MemcpyOp>,
       CopySimplification<LLVM::MemmoveOp>>(context);
@@ -1010,6 +980,12 @@ void Pointer2MemrefOp::getCanonicalizationPatterns(RewritePatternSet &results,
                  */
 }
 
+static bool hasStaticZeroOffset(MemRefType type) {
+  int64_t offset;
+  SmallVector<int64_t> strides;
+  return succeeded(type.getStridesAndOffset(strides, offset)) && offset == 0;
+}
+
 OpFoldResult Pointer2MemrefOp::fold(FoldAdaptor adaptor) {
   /// Simplify pointer2memref(cast(x)) to pointer2memref(x)
   if (auto mc = getSource().getDefiningOp<LLVM::BitcastOp>()) {
@@ -1037,7 +1013,8 @@ OpFoldResult Pointer2MemrefOp::fold(FoldAdaptor adaptor) {
     return getResult();
   }
   if (auto mc = getSource().getDefiningOp<enzymexla::Memref2PointerOp>()) {
-    if (mc.getSource().getType() == getType()) {
+    auto sourceType = cast<MemRefType>(mc.getSource().getType());
+    if (sourceType == getType() && hasStaticZeroOffset(sourceType)) {
       return mc.getSource();
     }
   }
