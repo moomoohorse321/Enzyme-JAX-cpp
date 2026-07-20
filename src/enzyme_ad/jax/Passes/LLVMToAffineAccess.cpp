@@ -547,6 +547,9 @@ struct GEPOfMemRefLoad : public OpRewritePattern<memref::LoadOp> {
 
 struct IndexCastAddSub : public OpRewritePattern<arith::IndexCastOp> {
   using OpRewritePattern<arith::IndexCastOp>::OpRewritePattern;
+  const DataLayoutAnalysis &dl;
+  IndexCastAddSub(MLIRContext *context, const DataLayoutAnalysis &dl)
+      : OpRewritePattern<arith::IndexCastOp>(context), dl(dl) {}
 
   LogicalResult matchAndRewrite(arith::IndexCastOp cst,
                                 PatternRewriter &rewriter) const override {
@@ -557,17 +560,32 @@ struct IndexCastAddSub : public OpRewritePattern<arith::IndexCastOp> {
       return failure();
     if (!isa<IndexType>(cst.getType()))
       return failure();
-    if (cast<IntegerType>(cst.getOperand().getType()).getWidth() < 32)
+    auto sourceType = dyn_cast<IntegerType>(cst.getOperand().getType());
+    auto indexWidth =
+        dl.getAtOrAbove(cst).getTypeIndexBitwidth(cst.getType());
+    if (!sourceType || !indexWidth || sourceType.getWidth() > *indexWidth)
+      return failure();
+
+    auto add = dyn_cast<arith::AddIOp>(op);
+    auto sub = dyn_cast<arith::SubIOp>(op);
+    if ((add && !add.hasNoSignedWrap()) || (sub && !sub.hasNoSignedWrap()))
       return failure();
 
     auto lhs = arith::IndexCastOp::create(rewriter, cst.getLoc(), cst.getType(),
                                           op->getOperand(0));
     auto rhs = arith::IndexCastOp::create(rewriter, cst.getLoc(), cst.getType(),
                                           op->getOperand(1));
-    if (isa<arith::AddIOp>(op)) {
-      rewriter.replaceOpWithNewOp<arith::AddIOp>(cst, lhs, rhs);
+    // nsw makes the source result fit its signed range. Signed extension to an
+    // at-least-as-wide index preserves the operands and that proof. Preserve
+    // exactly the nsw fact used here; unrelated flags need a separate proof.
+    if (add) {
+      auto replacement =
+          rewriter.replaceOpWithNewOp<arith::AddIOp>(cst, lhs, rhs);
+      replacement.setOverflowFlags(arith::IntegerOverflowFlags::nsw);
     } else {
-      rewriter.replaceOpWithNewOp<arith::SubIOp>(cst, lhs, rhs);
+      auto replacement =
+          rewriter.replaceOpWithNewOp<arith::SubIOp>(cst, lhs, rhs);
+      replacement.setOverflowFlags(arith::IntegerOverflowFlags::nsw);
     }
     return success();
   }
@@ -2026,10 +2044,9 @@ convertLLVMToAffineAccess(Operation *op,
     patterns.insert<ConvertLLVMAllocaToMemrefAlloca, GEPOfMemRefLoad,
                     SimplifyInPlaceAlloc<memref::AllocOp>,
                     SimplifyInPlaceAlloc<memref::AllocaOp>,
-                    SimplifyInPlaceAlloc<gpu::AllocOp>>(context,
-                                                        dataLayoutAnalysis);
-    patterns.insert<IndexCastAddSub, MemrefLoadAffineApply, SelectCSE,
-                    SelectAddrCast>(context);
+                    SimplifyInPlaceAlloc<gpu::AllocOp>, IndexCastAddSub>(
+        context, dataLayoutAnalysis);
+    patterns.insert<MemrefLoadAffineApply, SelectCSE, SelectAddrCast>(context);
     patterns.insert<SimplifyAllocConst<memref::AllocOp>,
                     SimplifyAllocConst<memref::AllocaOp>,
                     SimplifyAllocConst<gpu::AllocOp, true>>(context);
