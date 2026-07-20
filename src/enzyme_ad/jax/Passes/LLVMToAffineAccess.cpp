@@ -54,6 +54,7 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/LogicalResult.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include "Utils.h"
@@ -1145,7 +1146,8 @@ struct AffineExprBuilder {
               LLVM::MulOp, arith::MulIOp, LLVM::UDivOp, LLVM::SDivOp,
               arith::DivUIOp, arith::DivSIOp, LLVM::URemOp, arith::RemSIOp,
               LLVM::SRemOp, arith::RemUIOp, arith::ShRUIOp, arith::ShRSIOp,
-              LLVM::LShrOp, LLVM::AShrOp, arith::OrIOp>(op)) {
+              LLVM::LShrOp, LLVM::AShrOp, LLVM::AndOp, arith::AndIOp,
+              arith::OrIOp>(op)) {
         if (isa<LLVM::SDivOp, arith::DivSIOp, LLVM::AShrOp,
                 arith::ShRSIOp>(op) &&
             !fitsInAffineIndex(op->getOperand(0).getType())) {
@@ -1196,6 +1198,31 @@ struct AffineExprBuilder {
         } else if (isa<LLVM::URemOp, arith::RemSIOp, LLVM::SRemOp,
                        arith::RemUIOp>(op)) {
           return (*lhs) % (*rhs);
+        } else if (isa<LLVM::AndOp, arith::AndIOp>(op)) {
+          auto mask = dyn_cast<AffineConstantExpr>(*rhs);
+          AffineExpr value = *lhs;
+          if (!mask) {
+            mask = dyn_cast<AffineConstantExpr>(*lhs);
+            value = *rhs;
+          }
+          if (!mask || mask.getValue() < 0 ||
+              mask.getValue() == std::numeric_limits<int64_t>::max())
+            return failure();
+
+          // The low k bits are Euclidean modulo 2^k, including when the
+          // fixed-width input is interpreted as a negative signed integer.
+          uint64_t modulus = static_cast<uint64_t>(mask.getValue()) + 1;
+          if (!llvm::isPowerOf2_64(modulus) || !affineIndexBitwidth)
+            return failure();
+          // Keep the positive divisor representable when affine index
+          // arithmetic is eventually materialized at the target bit width.
+          unsigned exponent = llvm::Log2_64(modulus);
+          if (*affineIndexBitwidth <= 1 || exponent >= *affineIndexBitwidth - 1)
+            return failure();
+
+          auto modulusExpr = getAffineConstantExpr(
+              static_cast<int64_t>(modulus), op->getContext());
+          return value % modulusExpr;
         } else if (isa<arith::OrIOp>(op)) {
           auto cexpr = dyn_cast<AffineConstantExpr>(*rhs);
           if (!cexpr)
