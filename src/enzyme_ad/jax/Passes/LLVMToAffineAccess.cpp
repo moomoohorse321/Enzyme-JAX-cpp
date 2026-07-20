@@ -1552,7 +1552,16 @@ private:
     auto expr = getExpr(indices[0]);
     if (failed(expr))
       return std::nullopt;
-    AffineExpr offset = (*expr) * dataLayout.getTypeSize(currentType);
+    auto getFixedTypeSize = [&](Type type) -> std::optional<uint64_t> {
+      llvm::TypeSize size = dataLayout.getTypeSize(type);
+      if (size.isScalable())
+        return std::nullopt;
+      return size.getFixedValue();
+    };
+    auto currentTypeSize = getFixedTypeSize(currentType);
+    if (!currentTypeSize)
+      return std::nullopt;
+    AffineExpr offset = (*expr) * *currentTypeSize;
 
     for (auto index : llvm::drop_begin(indices)) {
       bool shouldCancel =
@@ -1561,8 +1570,11 @@ private:
                 auto expr = getExpr(index);
                 if (failed(expr))
                   return true;
-                offset = offset + (*expr) * dataLayout.getTypeSize(
-                                                arrayType.getElementType());
+                auto elementSize =
+                    getFixedTypeSize(arrayType.getElementType());
+                if (!elementSize)
+                  return true;
+                offset = offset + (*expr) * *elementSize;
                 currentType = arrayType.getElementType();
                 return false;
               })
@@ -1579,7 +1591,10 @@ private:
                   if (!structType.isPacked())
                     offset = alignTo(offset,
                                      dataLayout.getTypeABIAlignment(body[i]));
-                  offset = offset + dataLayout.getTypeSize(body[i]);
+                  auto fieldSize = getFixedTypeSize(body[i]);
+                  if (!fieldSize)
+                    return true;
+                  offset = offset + *fieldSize;
                 }
 
                 // Align for the current type as well.
