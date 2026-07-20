@@ -1,6 +1,8 @@
 #include "Passes.h"
 
 #include "mlir/Analysis/CallGraph.h"
+#include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
+#include "mlir/Analysis/DataFlow/IntegerRangeAnalysis.h"
 #include "mlir/Analysis/DataLayoutAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/AffineStructures.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -41,6 +43,7 @@
 #include "src/enzyme_ad/jax/Passes/EnzymeHLOPatterns.h"
 #include "src/enzyme_ad/jax/TransformOps/RaisingTransformOps.h"
 
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
@@ -55,9 +58,11 @@
 
 #include "Utils.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 
 #define DEBUG_TYPE "llvm-to-affine-access"
@@ -66,6 +71,8 @@ namespace mlir {
 namespace enzyme {
 #define GEN_PASS_DEF_LLVMTOAFFINEACCESSPASS
 #include "src/enzyme_ad/jax/Passes/Passes.h.inc"
+
+void loadAffineIntegerRangeAnalysis(DataFlowSolver &solver);
 } // namespace enzyme
 } // namespace mlir
 
@@ -842,9 +849,12 @@ static AffineExpr alignTo(AffineExpr expr, uint64_t a) {
 // overflows or underflows or trucation etc and insert a runtime guard against
 // that
 struct AffineExprBuilder {
-  AffineExprBuilder(Operation *user, bool legalizeSymbols)
-      : user(user), legalizeSymbols(legalizeSymbols) {}
+  AffineExprBuilder(Operation *user, bool legalizeSymbols,
+                    DataFlowSolver *rangeSolver = nullptr)
+      : user(user), rangeSolver(rangeSolver),
+        legalizeSymbols(legalizeSymbols) {}
   Operation *user;
+  DataFlowSolver *rangeSolver;
 
   SmallPtrSet<Value, 4> illegalSymbols;
 
@@ -985,7 +995,85 @@ struct AffineExprBuilder {
     return width && affineIndexBitwidth && *width <= *affineIndexBitwidth;
   }
 
+  const ConstantIntRanges *getIntegerRange(Value value) const {
+    if (!rangeSolver)
+      return nullptr;
+    auto *lattice =
+        rangeSolver->lookupState<dataflow::IntegerValueRangeLattice>(value);
+    if (!lattice || lattice->getValue().isUninitialized())
+      return nullptr;
+    return &lattice->getValue().getValue();
+  }
+
+  bool rangeProvesNoSignedWrap(Operation *op) const {
+    auto width = getIntegerBitwidth(op->getResult(0).getType());
+    const ConstantIntRanges *lhs = getIntegerRange(op->getOperand(0));
+    const ConstantIntRanges *rhs = getIntegerRange(op->getOperand(1));
+    if (!width || !lhs || !rhs)
+      return false;
+
+    uint64_t inputWidth = std::max<uint64_t>(
+        {*width, lhs->smin().getBitWidth(), rhs->smin().getBitWidth()});
+    if (inputWidth > (std::numeric_limits<unsigned>::max() - 2) / 2)
+      return false;
+    unsigned calcWidth = 2 * static_cast<unsigned>(inputWidth) + 2;
+    auto extend = [calcWidth](const APInt &value) {
+      return value.sext(calcWidth);
+    };
+
+    APInt lhsMin = extend(lhs->smin());
+    APInt lhsMax = extend(lhs->smax());
+    APInt rhsMin = extend(rhs->smin());
+    APInt rhsMax = extend(rhs->smax());
+    APInt resultMin(calcWidth, 0);
+    APInt resultMax(calcWidth, 0);
+    if (isa<LLVM::AddOp, arith::AddIOp>(op)) {
+      resultMin = lhsMin + rhsMin;
+      resultMax = lhsMax + rhsMax;
+    } else if (isa<LLVM::SubOp, arith::SubIOp>(op)) {
+      resultMin = lhsMin - rhsMax;
+      resultMax = lhsMax - rhsMin;
+    } else if (isa<LLVM::MulOp, arith::MulIOp>(op)) {
+      SmallVector<APInt, 4> products = {lhsMin * rhsMin, lhsMin * rhsMax,
+                                        lhsMax * rhsMin, lhsMax * rhsMax};
+      resultMin = resultMax = products.front();
+      for (const APInt &product : llvm::drop_begin(products)) {
+        if (product.slt(resultMin))
+          resultMin = product;
+        if (product.sgt(resultMax))
+          resultMax = product;
+      }
+    } else {
+      return false;
+    }
+
+    APInt signedMin =
+        APInt::getSignedMinValue(static_cast<unsigned>(*width)).sext(calcWidth);
+    APInt signedMax =
+        APInt::getSignedMaxValue(static_cast<unsigned>(*width)).sext(calcWidth);
+    return resultMin.sge(signedMin) && resultMax.sle(signedMax);
+  }
+
   bool preservesAffineIntegerSemantics(Operation *op) {
+    if (auto add = dyn_cast<LLVM::AddOp>(op))
+      return fitsInAffineIndex(add.getType()) &&
+             (add.hasNoSignedWrap() || rangeProvesNoSignedWrap(op));
+    if (auto add = dyn_cast<arith::AddIOp>(op))
+      return fitsInAffineIndex(add.getType()) &&
+             (add.hasNoSignedWrap() || rangeProvesNoSignedWrap(op));
+    if (auto sub = dyn_cast<LLVM::SubOp>(op))
+      return fitsInAffineIndex(sub.getType()) &&
+             (sub.hasNoSignedWrap() || rangeProvesNoSignedWrap(op));
+    if (auto sub = dyn_cast<arith::SubIOp>(op))
+      return fitsInAffineIndex(sub.getType()) &&
+             (sub.hasNoSignedWrap() || rangeProvesNoSignedWrap(op));
+    if (auto mul = dyn_cast<LLVM::MulOp>(op))
+      return fitsInAffineIndex(mul.getType()) &&
+             (mul.hasNoSignedWrap() || rangeProvesNoSignedWrap(op));
+    if (auto mul = dyn_cast<arith::MulIOp>(op))
+      return fitsInAffineIndex(mul.getType()) &&
+             (mul.hasNoSignedWrap() || rangeProvesNoSignedWrap(op));
+
     if (auto div = dyn_cast<LLVM::SDivOp>(op))
       return div.getIsExact();
     if (auto div = dyn_cast<arith::DivSIOp>(op))
@@ -1199,8 +1287,9 @@ private:
   };
 
 public:
-  AffineAccessBuilder(Operation *accessOp, bool legalizeSymbols)
-      : AffineExprBuilder(accessOp, legalizeSymbols) {}
+  AffineAccessBuilder(Operation *accessOp, bool legalizeSymbols,
+                      DataFlowSolver *rangeSolver)
+      : AffineExprBuilder(accessOp, legalizeSymbols, rangeSolver) {}
 
   PtrVal base = nullptr;
 
@@ -1828,6 +1917,11 @@ convertLLVMToAffineAccess(Operation *op,
 
   MLIRContext *context = op->getContext();
 
+  DataFlowSolver rangeSolver;
+  rangeSolver.load<dataflow::DeadCodeAnalysis>();
+  enzyme::loadAffineIntegerRangeAnalysis(rangeSolver);
+  bool hasIntegerRanges = succeeded(rangeSolver.initializeAndRun(op));
+
   MemrefConverter mc;
   IndexConverter ic;
 
@@ -1837,7 +1931,9 @@ convertLLVMToAffineAccess(Operation *op,
     LLVM_DEBUG(llvm::dbgs() << "Building affine access for " << op
                             << " for address " << addr << "\n");
     accessBuilders.push_back(
-        std::make_unique<AffineAccessBuilder>(op, legalizeSymbols));
+        std::make_unique<AffineAccessBuilder>(op, legalizeSymbols,
+                                              hasIntegerRanges ? &rangeSolver
+                                                               : nullptr));
     AffineAccessBuilder &aab = *accessBuilders.back();
     auto dl = dataLayoutAnalysis.getAtOrAbove(op);
     accessBuilt.push_back(succeeded(aab.build(dl, addr)));
